@@ -1,0 +1,15 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+.cxx/
+captures/
+*.jks
+*.keystore
+*.p12
+keystore/
+signing.properties
+# Vendor protocol PDFs are not redistributed (see README)
+docs/*.pdf
