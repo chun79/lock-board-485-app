@@ -13,3 +13,5 @@ keystore/
 signing.properties
 # Vendor protocol PDFs are not redistributed (see README)
 docs/*.pdf
+!docs/用户手册.pdf
+docs/manual/manual.html
