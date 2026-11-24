@@ -1,5 +1,6 @@
 package cn.tuodi.lockboard.core.testing
 
+import cn.tuodi.lockboard.core.config.AppInfo
 import cn.tuodi.lockboard.core.protocol.toHex
 import org.json.JSONArray
 import org.json.JSONObject
@@ -16,6 +17,8 @@ object ReportFormatter {
         appendLine("总体结论：${r.verdict.label}${if (r.cancelled) "（测试被中止，结果不完整）" else ""}")
         if (!r.physicalTransport) appendLine("⚠ 本报告来自模拟器，只验证 App 逻辑，不代表实物验收。")
         appendLine("App 版本：${r.appVersion}")
+        appendLine("开发与版权：${AppInfo.COPYRIGHT}（${AppInfo.AUTHOR} <${AppInfo.EMAIL}>，${AppInfo.LICENSE}）")
+        appendLine("项目与反馈：${AppInfo.REPO_URL}（意见反馈：${AppInfo.ISSUES_URL}）")
         appendLine("开始：${time(r.startedAtMillis)}    结束：${time(r.finishedAtMillis)}")
         appendLine("链路：${r.transport}")
         appendLine("参数：${r.settingsSummary}")
@@ -50,6 +53,11 @@ object ReportFormatter {
         put("cancelled", r.cancelled)
         put("simulated", !r.physicalTransport)
         put("appVersion", r.appVersion)
+        put("author", "${AppInfo.AUTHOR} <${AppInfo.EMAIL}>")
+        put("copyright", AppInfo.COPYRIGHT)
+        put("license", AppInfo.LICENSE)
+        put("repository", AppInfo.REPO_URL)
+        put("feedback", AppInfo.ISSUES_URL)
         put("startedAt", time(r.startedAtMillis))
         put("finishedAt", time(r.finishedAtMillis))
         put("transport", r.transport)

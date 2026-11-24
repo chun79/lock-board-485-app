@@ -5,6 +5,7 @@ import cn.tuodi.lockboard.core.client.CommLog
 import cn.tuodi.lockboard.core.client.LockBoardClient
 import cn.tuodi.lockboard.core.client.SafetyPolicy
 import cn.tuodi.lockboard.core.config.AppConfig
+import cn.tuodi.lockboard.core.config.AppInfo
 import cn.tuodi.lockboard.core.config.BoardProfile
 import cn.tuodi.lockboard.core.config.ChannelProfile
 import cn.tuodi.lockboard.core.config.ChannelType
@@ -76,7 +77,15 @@ class TestRunnerTest {
         assertEquals(listOf(2, 0), report.boards.single().privateVersion)
         assertEquals(2, report.boards.single().modbusVersion)
         assertTrue(text.contains("模拟器"))
-        JSONObject(ReportFormatter.toJson(report).toString())
+        assertTrue(text.contains(AppInfo.AUTHOR))
+        assertTrue(text.contains(AppInfo.COPYRIGHT))
+        assertTrue(text.contains(AppInfo.REPO_URL))
+        assertTrue(text.contains(AppInfo.ISSUES_URL))
+        val json = JSONObject(ReportFormatter.toJson(report).toString())
+        assertEquals("${AppInfo.AUTHOR} <${AppInfo.EMAIL}>", json.getString("author"))
+        assertEquals(AppInfo.COPYRIGHT, json.getString("copyright"))
+        assertEquals(AppInfo.REPO_URL, json.getString("repository"))
+        assertEquals(AppInfo.ISSUES_URL, json.getString("feedback"))
         File("build").mkdirs()
         File("build/sample-report.txt").writeText(text)
     }

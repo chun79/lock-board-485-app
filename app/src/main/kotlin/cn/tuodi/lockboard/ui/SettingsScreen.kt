@@ -1,7 +1,15 @@
 package cn.tuodi.lockboard.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -9,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedButton
@@ -23,12 +32,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import cn.tuodi.lockboard.app.AppController
 import cn.tuodi.lockboard.core.client.ClientSettings
+import cn.tuodi.lockboard.core.config.AppInfo
 import cn.tuodi.lockboard.core.config.BoardProfile
 import cn.tuodi.lockboard.core.config.ChannelProfile
 import cn.tuodi.lockboard.core.config.ChannelType
@@ -36,9 +47,11 @@ import cn.tuodi.lockboard.core.config.DipSwitch
 import cn.tuodi.lockboard.core.sim.SimBoardConfig
 import cn.tuodi.lockboard.core.sim.SimConfig
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(controller: AppController) {
     val cfg by controller.config.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     var askReset by remember { mutableStateOf(false) }
     fun client(t: (ClientSettings) -> ClientSettings) = controller.updateConfig { it.copy(client = t(it.client).validated()) }
     fun sim(t: (SimConfig) -> SimConfig) = controller.updateConfig { it.copy(sim = t(it.sim)) }
@@ -98,13 +111,48 @@ fun SettingsScreen(controller: AppController) {
 
         SectionCard("关于") {
             Text("App 版本：${controller.appVersion}")
-            Text("依据：12 路锁控板私有通讯协议、MODBUS RTU 协议（2026-10-06，固件 LOCK_12_MODBUS_TIMED_20261006）")
+            SelectionContainer {
+                Column {
+                    Text("开发：${AppInfo.AUTHOR} <${AppInfo.EMAIL}>")
+                    Text("版权：${AppInfo.COPYRIGHT} · ${AppInfo.LICENSE}")
+                    Text("项目主页：${AppInfo.REPO_URL}")
+                    Hint("意见反馈：欢迎通过 GitHub Issues 或邮件提交问题与建议")
+                }
+            }
+            Text("依据：12 路锁控板私有通讯协议、MODBUS RTU 协议（2026-10-06，固件 LOCK_12_MODBUS_TIMED_20261006）", modifier = Modifier.padding(top = 4.dp))
             Hint("私有协议：9600 8N1；DC 02 地址 指令 LEN 数据 SUM(地址..数据 累加低 8 位)，回复 DC FE。MODBUS RTU：同一串口，CRC16(A001)，地址 00 为广播。")
             Hint("首字节为 DC 的帧进入私有协议，其余进入 MODBUS；两套协议共用输出、定时器和脉冲任务。")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp)) {
+                OutlinedButton(onClick = { openUrlOrCopy(context, "项目主页", AppInfo.REPO_URL, "未检测到浏览器，已复制项目地址") }) {
+                    Text("打开项目主页")
+                }
+                OutlinedButton(onClick = { openUrlOrCopy(context, "意见反馈", AppInfo.ISSUES_URL, "未检测到浏览器，已复制反馈地址") }) {
+                    Text("意见反馈")
+                }
+                OutlinedButton(onClick = { copyText(context, "项目主页", AppInfo.REPO_URL, "已复制项目地址") }) {
+                    Text("复制项目地址")
+                }
+            }
             OutlinedButton(onClick = { askReset = true }, modifier = Modifier.padding(top = 6.dp)) { Text("恢复全部默认设置") }
         }
     }
     if (askReset) ConfirmDialog("恢复默认", "将清除通信参数、板卡档案、测试与模拟器设置。", onConfirm = { controller.resetConfig() }, onDismiss = { askReset = false })
+}
+
+private fun copyText(context: Context, label: String, text: String, toastMessage: String) {
+    val copied = runCatching {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return@runCatching false
+        cm.setPrimaryClip(ClipData.newPlainText(label, text))
+        true
+    }.getOrDefault(false)
+    Toast.makeText(context, if (copied) toastMessage else "无法复制，请手动记录：$text", Toast.LENGTH_SHORT).show()
+}
+
+private fun openUrlOrCopy(context: Context, label: String, url: String, fallbackToast: String) {
+    val opened = runCatching {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.isSuccess
+    if (!opened) copyText(context, label, url, fallbackToast)
 }
 
 @Composable

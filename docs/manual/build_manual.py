@@ -765,7 +765,7 @@ def build_html() -> str:
   </div>
 
   <div class="cover-footer">
-    <span>版本：1.0.0 · 依据协议版本：2026-10-06（私有 02 00 / MODBUS 0002）</span>
+    <span>版本：1.0.2 · Copyright © 2026 郭春良 · 项目与反馈：https://github.com/chun79/lock-board-485-app</span>
     <span>许可证：Apache License 2.0</span>
   </div>
 </div>
@@ -1141,9 +1141,11 @@ def build_html() -> str:
 </table>
 
 <div class="callout callout-ok">
-  <div class="callout-title">附录：技术支持与文档索引</div>
-  本手册对应源码仓库 <code>lock-board-485-app</code>（v1.0.0）。更多设计细节与协议边界说明可参阅仓库文档：
-  <code>docs/设计说明.md</code>、<code>docs/协议文档说明-20261006.md</code>、<code>docs/真机验收清单.md</code> 及 <code>docs/示例报告-模拟器.txt</code>。
+  <div class="callout-title">附录：关于、技术支持与意见反馈</div>
+  <strong>开发与版权</strong>：郭春良 &lt;<code>guo.chunliang@gmail.com</code>&gt; · Copyright © 2026 郭春良 · Apache License 2.0<br/>
+  <strong>项目主页</strong>：<code>https://github.com/chun79/lock-board-485-app</code><br/>
+  <strong>意见反馈</strong>：欢迎通过 GitHub Issues（<code>https://github.com/chun79/lock-board-485-app/issues</code>）或邮件提交问题与建议。<br/>
+  <strong>配套文档</strong>：更多设计细节与协议边界说明可参阅仓库文档 <code>docs/设计说明.md</code>、<code>docs/协议文档说明-20261006.md</code>、<code>docs/真机验收清单.md</code> 及 <code>docs/示例报告-模拟器.txt</code>。
 </div>
 
 </body>
