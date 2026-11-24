@@ -162,6 +162,47 @@ sealed class Command<out R : Reply>(override val address: Int, val code: Int, va
             }
         }
     }
+
+    companion object {
+        /** Builds the typed command when [code] and [data] match a known protocol request. */
+        fun knownOrNull(address: Int, code: Int, data: List<Int>): Command<*>? = when (code) {
+            Cmd.GET_VERSION -> if (data.isEmpty()) GetVersion(address) else null
+            Cmd.UNLOCK_ONE -> if (data.size == 1 && Protocol.isValidChannel(data[0])) UnlockOne(address, data[0]) else null
+            Cmd.READ_ONE -> if (data.size == 1 && Protocol.isValidChannel(data[0])) ReadOne(address, data[0]) else null
+            Cmd.READ_ALL -> if (data.isEmpty()) ReadAll(address) else null
+            Cmd.UNLOCK_ALL -> if (data.isEmpty()) UnlockAll(address) else null
+            Cmd.UNLOCK_MANY -> data.takeIf { it.size == 2 }?.let {
+                val m = LockMask.fromBytes(it[0], it[1])
+                if (m and Protocol.UNUSED_MASK_BITS == 0) UnlockMany(address, m) else null
+            }
+            Cmd.SET_OUTPUT -> when {
+                data.size == 2 && Protocol.isValidChannel(data[0]) && data[1] in 0..1 -> SetOutput(address, data[0], data[1] == 1)
+                data.size == 4 && Protocol.isValidChannel(data[0]) && data[1] == 0 -> SetOutput(address, data[0], false)
+                data.size == 4 && Protocol.isValidChannel(data[0]) && data[1] == 1 && ((data[2] shl 8) or data[3]) in 1..0xFFFF ->
+                    SetOutputTimed(address, data[0], (data[2] shl 8) or data[3])
+                else -> null
+            }
+            Cmd.UNLOCK_SIMULTANEOUS -> data.takeIf { it.size == 2 }?.let {
+                val m = LockMask.fromBytes(it[0], it[1])
+                if (m and Protocol.UNUSED_MASK_BITS == 0) UnlockSimultaneous(address, m) else null
+            }
+            Cmd.SET_OUTPUTS -> data.takeIf { it.size == 2 }?.let {
+                val m = LockMask.fromBytes(it[0], it[1])
+                if (m and Protocol.UNUSED_MASK_BITS == 0) SetOutputs(address, m) else null
+            }
+            else -> null
+        }
+
+        /**
+         * For known protocol commands, checks that [reply] decodes cleanly with the expected format;
+         * replies to malformed known requests do not qualify, while genuinely unknown commands pass.
+         */
+        fun isConfirmedReplyFrame(code: Int, reqData: List<Int>, reply: Frame): Boolean {
+            val known = knownOrNull(reply.address, code, reqData)
+            if (known != null) return runCatching { known.decode(reply) }.isSuccess
+            return code !in Cmd.SUPPORTED
+        }
+    }
 }
 
 /** Anything a result can refer to (private command or MODBUS request). */

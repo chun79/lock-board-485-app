@@ -66,10 +66,16 @@ fun MainScreen(controller: AppController, usb: UsbAdapters?) {
                     Text("485 锁控板测试", style = MaterialTheme.typography.titleMedium)
                     val status = when (link.status) {
                         LinkStatus.CONNECTED -> "${link.description} · 当前地址 ${board.address}"
+                        LinkStatus.PROBING, LinkStatus.NO_BOARD -> "${link.status.label} · ${link.description}"
                         else -> link.status.label + if (link.message.isNotBlank()) "：${link.message}" else ""
                     }
                     Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("linkStatus"),
-                        color = if (link.status == LinkStatus.LOST) FailColor else MaterialTheme.colorScheme.onSurfaceVariant)
+                        color = when (link.status) {
+                            LinkStatus.CONNECTED -> OpenColor
+                            LinkStatus.NO_BOARD -> WarnColor
+                            LinkStatus.LOST -> FailColor
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        })
                 }
             })
         },

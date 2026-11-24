@@ -54,7 +54,7 @@ fun TerminalScreen(controller: AppController) {
     val lastResult by controller.lastResult.collectAsStateWithLifecycle()
     val board by controller.board.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    val connected = link.status == LinkStatus.CONNECTED
+    val linkOpen = link.status.isOpen
     var address by rememberSaveable(board.address) { mutableIntStateOf(board.address) }
     var command by rememberSaveable { mutableIntStateOf(Cmd.GET_VERSION) }
     var dataHex by rememberSaveable { mutableStateOf("") }
@@ -88,7 +88,7 @@ fun TerminalScreen(controller: AppController) {
             OutlinedTextField(dataHex, { dataHex = it }, label = { Text("数据段 HEX（如 01 或 00 07）") }, singleLine = true,
                 modifier = Modifier.fillMaxWidth().testTag("dataHex"))
             Text("帧：$framePreview", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-            Button(onClick = { controller.sendFrame(address, command, dataHex) }, enabled = connected && frameError == null, modifier = Modifier.testTag("sendFrame")) {
+            Button(onClick = { controller.sendFrame(address, command, dataHex) }, enabled = linkOpen && frameError == null, modifier = Modifier.testTag("sendFrame")) {
                 Text("发送私有帧（经安全策略）")
             }
             HorizontalDivider(Modifier.padding(vertical = 6.dp))
@@ -105,7 +105,7 @@ fun TerminalScreen(controller: AppController) {
             Button(onClick = {
                 val send = { controller.sendModbusFrame(mbAddress, mbFunction, mbPayload, broadcastConfirmed = mbAddress == 0) }
                 if (mbAddress == 0) confirmBroadcast = send else send()
-            }, enabled = connected && controller.frameError(mbAddress, mbFunction, mbPayload) == null, modifier = Modifier.testTag("sendModbus")) {
+            }, enabled = linkOpen && controller.frameError(mbAddress, mbFunction, mbPayload) == null, modifier = Modifier.testTag("sendModbus")) {
                 Text("发送 MODBUS 帧（自动 CRC，经安全策略）")
             }
             HorizontalDivider(Modifier.padding(vertical = 6.dp))
@@ -115,7 +115,10 @@ fun TerminalScreen(controller: AppController) {
                 Button(onClick = {
                     if (controller.isBroadcastFrame(rawHex)) confirmBroadcast = { controller.sendRawHex(rawHex, listenMs, broadcastConfirmed = true) }
                     else controller.sendRawHex(rawHex, listenMs)
-                }, enabled = connected, modifier = Modifier.testTag("sendRaw")) { Text("发送原始") }
+                }, enabled = linkOpen, modifier = Modifier.testTag("sendRaw")) { Text("发送原始") }
+            }
+            if (link.status == LinkStatus.NO_BOARD) {
+                Hint("通道已打开（未检测到板卡）：可用于发送诊断帧或查看接收日志", WarnColor)
             }
             Hint(if (link.simulated) "模拟器：允许任意字节。" else "真实总线：每次只允许 1 个完整帧（DC 02 私有帧或 CRC 正确的 MODBUS 请求），并检查安全策略。")
             if (lastResult.isNotBlank()) Text(lastResult, fontSize = 12.sp)

@@ -9,11 +9,14 @@ import cn.tuodi.lockboard.app.ControlProtocol
 import cn.tuodi.lockboard.app.LinkStatus
 import cn.tuodi.lockboard.app.OpenedTransport
 import cn.tuodi.lockboard.app.TransportFactory
+import cn.tuodi.lockboard.core.client.ByteTransport
 import cn.tuodi.lockboard.core.client.LogKind
 import cn.tuodi.lockboard.core.client.OutputKey
+import cn.tuodi.lockboard.core.client.TransportKind
 import cn.tuodi.lockboard.core.config.ChannelProfile
 import cn.tuodi.lockboard.core.config.ChannelType
 import cn.tuodi.lockboard.core.config.ConfigJson
+import cn.tuodi.lockboard.core.modbus.Crc16
 import cn.tuodi.lockboard.core.protocol.LockMask
 import cn.tuodi.lockboard.core.sim.SimBoardConfig
 import cn.tuodi.lockboard.core.sim.SimConfig
@@ -25,6 +28,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -231,11 +236,12 @@ class AppControllerTest {
         controller.onUsbDetached("模拟总线")
         waitFor(what = "链路断开") { controller.link.value.status == LinkStatus.LOST }
         val carriedMsg = "上次会话未经读回确认关断的输出"
-        // Another bus (a silent TCP server): the simulator's carry must not be imported or consumed.
+        // Another bus (a silent TCP server): physical link opens in NO_BOARD, never CONNECTED, and does not touch simulator carry.
         java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress()).use { server ->
             controller.updateConfig { it.copy(connection = it.connection.copy(type = cn.tuodi.lockboard.core.config.TransportType.TCP, tcpHost = "127.0.0.1", tcpPort = server.localPort)) }
             controller.connect()
-            waitFor(what = "TCP 连接") { controller.link.value.status == LinkStatus.CONNECTED }
+            waitFor(what = "TCP 无板卡进入 NO_BOARD") { controller.link.value.status == LinkStatus.NO_BOARD }
+            assertFalse(controller.link.value.status == LinkStatus.CONNECTED)
             Thread.sleep(200)
             assertFalse(controller.log.snapshot().any { it.text.contains(carriedMsg) })
             assertTrue(controller.outputs.value.isEmpty())
@@ -294,5 +300,195 @@ class AppControllerTest {
         assertEquals("三号柜", again.config.value.profile(3).name)
         assertEquals(2, again.config.value.maxLockTimedSeconds)
         assertEquals(ConfigJson.encode(store.config.value), ConfigJson.encode(again.config.value))
+    }
+
+    private class PhysicalSimTransport(
+        override val kind: TransportKind = TransportKind.UART,
+        override val description: String = "/dev/ttyS1",
+        @Volatile var target: ByteTransport? = null,
+    ) : ByteTransport {
+        @Volatile var closed = false
+        override fun write(bytes: ByteArray) {
+            if (closed) throw java.io.IOException("串口已关闭")
+            target?.write(bytes)
+        }
+        override fun read(buffer: ByteArray, timeoutMs: Int): Int {
+            if (closed) throw java.io.IOException("串口已关闭")
+            val t = target
+            return if (t != null) t.read(buffer, timeoutMs) else {
+                Thread.sleep(timeoutMs.coerceIn(1, 50).toLong())
+                0
+            }
+        }
+        override fun drainInput(): ByteArray = target?.drainInput() ?: ByteArray(0)
+        override fun close() {
+            closed = true
+            target?.close()
+        }
+    }
+
+    @Test fun `silent physical UART opens in NO_BOARD, never CONNECTED, and allows terminal and disconnect`() {
+        val transport = PhysicalSimTransport()
+        val c2 = AppController(store, TransportFactory { OpenedTransport(transport, "RS485 已启用") }, scope, exportDir, "test")
+        val seen = CopyOnWriteArrayList<LinkStatus>()
+        val watch = scope.launch { c2.link.collect { seen += it.status } }
+        try {
+            c2.connect()
+            waitFor(what = "静默串口进入 NO_BOARD") { c2.link.value.status == LinkStatus.NO_BOARD }
+            assertTrue(c2.link.value.status.isOpen)
+            assertFalse(LinkStatus.CONNECTED in seen)
+            assertTrue(c2.link.value.message.contains("无回复"))
+            assertTrue(c2.link.value.message.contains("RS485 已启用"))
+            c2.sendFrame(1, 0x01, "")
+            waitFor(what = "终端发送超时") { c2.lastResult.value.contains("超时") }
+            assertEquals(LinkStatus.NO_BOARD, c2.link.value.status)
+            assertFalse(LinkStatus.CONNECTED in seen)
+            c2.disconnect()
+            waitFor(what = "断开") { c2.link.value.status == LinkStatus.DISCONNECTED }
+            waitFor(what = "传输关闭") { transport.closed }
+        } finally {
+            watch.cancel()
+        }
+    }
+
+    @Test fun `physical UART with online board probes address 4 and transitions to CONNECTED`() {
+        val bus = SimulatedBus(SimConfig(boards = listOf(SimBoardConfig(4)), responseDelayMs = 1))
+        val transport = PhysicalSimTransport(target = bus)
+        val c2 = AppController(store, TransportFactory { OpenedTransport(transport) }, scope, exportDir, "test")
+        c2.connect()
+        waitFor(what = "串口自动探测到地址 4") {
+            c2.link.value.status == LinkStatus.CONNECTED &&
+                c2.board.value.address == 4 &&
+                c2.board.value.privateVersion == listOf(2, 0)
+        }
+        c2.disconnect()
+        waitFor(what = "断开") { c2.link.value.status == LinkStatus.DISCONNECTED }
+        waitFor(what = "传输关闭") { transport.closed }
+    }
+
+    @Test fun `physical UART upgrades from NO_BOARD on reply and downgrades back on empty scan`() {
+        val transport = PhysicalSimTransport(target = null)
+        val c2 = AppController(store, TransportFactory { OpenedTransport(transport) }, scope, exportDir, "test")
+        c2.connect()
+        waitFor(what = "初始无板卡") { c2.link.value.status == LinkStatus.NO_BOARD }
+        transport.target = SimulatedBus(SimConfig(boards = listOf(SimBoardConfig(1)), responseDelayMs = 1))
+        c2.readVersion()
+        waitFor(what = "收到回复转为已连接") {
+            c2.link.value.status == LinkStatus.CONNECTED &&
+                c2.board.value.privateVersion == listOf(2, 0) &&
+                c2.busy.value == null
+        }
+        transport.target = null
+        c2.scan()
+        waitFor(what = "扫描完成") { !c2.scan.value.running && c2.scan.value.finishedAtMillis != null }
+        waitFor(what = "空扫描降级为 NO_BOARD") { c2.link.value.status == LinkStatus.NO_BOARD }
+        c2.disconnect()
+        waitFor(what = "断开") { c2.link.value.status == LinkStatus.DISCONNECTED }
+        waitFor(what = "传输关闭") { transport.closed }
+    }
+
+    @Test fun `disconnect while probing closes transport and stays DISCONNECTED`() {
+        store.update { it.copy(scanTimeoutMs = 120) }
+        val transport = PhysicalSimTransport(target = null)
+        val c2 = AppController(store, TransportFactory { OpenedTransport(transport) }, scope, exportDir, "test")
+        c2.connect()
+        waitFor(what = "进入探测中") { c2.link.value.status == LinkStatus.PROBING }
+        c2.disconnect()
+        waitFor(what = "探测中断开") { c2.link.value.status == LinkStatus.DISCONNECTED }
+        waitFor(what = "传输关闭") { transport.closed }
+        Thread.sleep(300)
+        assertEquals(LinkStatus.DISCONNECTED, c2.link.value.status)
+    }
+
+    @Test fun `IO failure while probing transitions immediately to LOST`() {
+        val failing = object : ByteTransport {
+            override val kind = TransportKind.TCP
+            override val description = "TCP 127.0.0.1:0"
+            override fun write(bytes: ByteArray) {}
+            override fun read(buffer: ByteArray, timeoutMs: Int): Int = throw java.io.IOException("对端已关闭连接")
+            override fun drainInput() = ByteArray(0)
+            override fun close() {}
+        }
+        val c2 = AppController(store, TransportFactory { OpenedTransport(failing) }, scope, exportDir, "test")
+        c2.connect()
+        waitFor(what = "探测期 I/O 异常转 LOST") { c2.link.value.status == LinkStatus.LOST }
+        assertTrue(c2.link.value.message.contains("对端已关闭连接"))
+    }
+
+    @Test fun `protocol error or unmatched frame does not mark NO_BOARD as CONNECTED`() {
+        // Replies to 0x12 with a valid-checksum 0x12 frame whose unused feedback bits 12..15 are non-zero -> ProtocolException.
+        val malformed = object : ByteTransport {
+            override val kind = TransportKind.UART
+            override val description = "/dev/ttyS1"
+            private var reply: ByteArray = ByteArray(0)
+            override fun write(bytes: ByteArray) {
+                if (bytes.size >= 4 && (bytes[0].toInt() and 0xFF) == 0xDC && (bytes[3].toInt() and 0xFF) == 0x12) {
+                    reply = cn.tuodi.lockboard.core.protocol.FrameCodec.encode(1, 0x12, listOf(0xFF, 0xFF), direction = cn.tuodi.lockboard.core.protocol.Direction.BOARD_TO_HOST)
+                        .map { it.toByte() }.toByteArray()
+                }
+            }
+            override fun read(buffer: ByteArray, timeoutMs: Int): Int {
+                if (reply.isEmpty()) {
+                    Thread.sleep(timeoutMs.coerceIn(1, 50).toLong())
+                    return 0
+                }
+                val n = minOf(buffer.size, reply.size)
+                System.arraycopy(reply, 0, buffer, 0, n)
+                reply = reply.copyOfRange(n, reply.size)
+                return n
+            }
+            override fun drainInput() = ByteArray(0)
+            override fun close() {}
+        }
+        val c2 = AppController(store, TransportFactory { OpenedTransport(malformed) }, scope, exportDir, "test")
+        val seen = CopyOnWriteArrayList<LinkStatus>()
+        val watch = scope.launch { c2.link.collect { seen += it.status } }
+        try {
+            c2.connect()
+            waitFor(what = "畸形回复不升为 CONNECTED") { c2.link.value.status == LinkStatus.NO_BOARD }
+            c2.sendFrame(1, 0x12, "")
+            waitFor(what = "终端组帧发送完成") { c2.lastResult.value.contains("数据 [FF FF]") }
+            assertEquals(LinkStatus.NO_BOARD, c2.link.value.status)
+            c2.sendRawHex("DC 02 01 12 00 13", 80)
+            waitFor(what = "原始 HEX 发送完成") { c2.lastResult.value.contains("收到 1 个私有帧") }
+            assertEquals(LinkStatus.NO_BOARD, c2.link.value.status)
+            assertFalse(LinkStatus.CONNECTED in seen)
+        } finally {
+            watch.cancel()
+        }
+    }
+
+    @Test fun `MODBUS exception reply still confirms board online during probe and scan`() {
+        // Replies to MODBUS 03(0001) at address 1 with MODBUS exception 02 (illegal data address), silent on private protocol.
+        val modbusExOnly = object : ByteTransport {
+            override val kind = TransportKind.UART
+            override val description = "/dev/ttyS1"
+            private var reply: ByteArray = ByteArray(0)
+            override fun write(bytes: ByteArray) {
+                if (bytes.isNotEmpty() && (bytes[0].toInt() and 0xFF) == 1 && (bytes[1].toInt() and 0xFF) == 0x03) {
+                    val frame = Crc16.append(listOf(1, 0x83, 0x02))
+                    reply = frame.map { it.toByte() }.toByteArray()
+                }
+            }
+            override fun read(buffer: ByteArray, timeoutMs: Int): Int {
+                if (reply.isEmpty()) {
+                    Thread.sleep(timeoutMs.coerceIn(1, 50).toLong())
+                    return 0
+                }
+                val n = minOf(buffer.size, reply.size)
+                System.arraycopy(reply, 0, buffer, 0, n)
+                reply = reply.copyOfRange(n, reply.size)
+                return n
+            }
+            override fun drainInput() = ByteArray(0)
+            override fun close() {}
+        }
+        val c2 = AppController(store, TransportFactory { OpenedTransport(modbusExOnly) }, scope, exportDir, "test")
+        c2.connect()
+        waitFor(what = "MODBUS 异常回复确认在线") { c2.link.value.status == LinkStatus.CONNECTED }
+        c2.scan()
+        waitFor(what = "扫描完成") { !c2.scan.value.running && c2.scan.value.finishedAtMillis != null }
+        assertEquals(LinkStatus.CONNECTED, c2.link.value.status)
+        assertTrue(c2.scan.value.online.any { it.address == 1 && it.modbusException == 2 })
     }
 }

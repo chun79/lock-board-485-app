@@ -174,6 +174,10 @@ class LockBoardClient(
 
     val isOpen: Boolean get() = failure == null
 
+    /** Invoked on the transaction thread whenever a request receives a confirmed, non-broadcast reply. */
+    @Volatile
+    var onConfirmedReply: (() -> Unit)? = null
+
     /** Monotonic time of the most recent write (any transaction). */
     @Volatile
     var lastWriteNanos: Long = 0L
@@ -495,7 +499,9 @@ class LockBoardClient(
                     }
                     val latency = ((d.receivedAt - sentAt) / 1_000_000).coerceAtLeast(0)
                     val notes = if (ambiguous) listOf("更早的同类请求仍可能迟到回复，本回复归属不明") else emptyList()
-                    return afterOk(CommResult.Ok(info, d.reply!!, d.raw, latency, attempt, notes, ambiguous, writeAt))
+                    val ok = afterOk(CommResult.Ok(info, d.reply!!, d.raw, latency, attempt, notes, ambiguous, writeAt))
+                    if (ok.confirmed && isConfirmedTransactionReply(info, ok.raw)) onConfirmedReply?.invoke()
+                    return ok
                 }
             }
             m.finish()
@@ -808,7 +814,7 @@ class LockBoardClient(
         modbus?.let { outputs.registerPossiblyOn(energizedByModbus(it)) }
         privateFrame?.let { outputs.registerPossiblyOn(energizedByPrivate(it.address, it.command, it.data)) }
         val writtenAt = clock.nanoTime()
-        key?.let { onWriteHygiene(it, writtenAt) }
+        val ambiguous = key != null && onWriteHygiene(key, writtenAt)
         var answered = false
         val pulseChannels = modbus?.pulsedChannels() ?: privateFrame?.let { Command.Custom(it.address, it.command, it.data).pulsedChannels() } ?: emptyList()
         val pulseSequential = modbus?.let { it.function == Modbus.FC_WRITE_SINGLE_COIL || it.function == Modbus.FC_WRITE_MULTIPLE_COILS }
@@ -885,16 +891,31 @@ class LockBoardClient(
                 stats.garbageBytes.addAndGet(garbage.size.toLong())
                 log.add(LogKind.GARBAGE, "非私有帧字节", garbage)
             }
+            val confirmedRawReply = !ambiguous && when {
+                modbus != null -> !modbus.isBroadcast && modbusReply != null && modbusReply !is ModbusReply.Raw
+                privateFrame != null && privateFrame.checksumValid -> received.any {
+                    it.address == privateFrame.address && it.command == privateFrame.command &&
+                        Command.isConfirmedReplyFrame(privateFrame.command, privateFrame.data, it)
+                }
+                else -> false
+            }
             answered = when {
                 modbus != null -> modbus.isBroadcast || modbusReply != null
                 privateFrame != null -> received.any { it.address == privateFrame.address && it.command == privateFrame.command }
                 else -> true
             }
+            if (confirmedRawReply) onConfirmedReply?.invoke()
             if (!answered) quarantineUntil = clock.nanoTime() + s.lateReplyGuardMs * 1_000_000L
             return RawExchange(bytes, received, bad, garbage, (clock.nanoTime() - start) / 1_000_000, writtenAtNanos = writtenAt, modbusReply = modbusReply)
         } finally {
             if (!answered && key != null) markDirty(key, writtenAt)
         }
+    }
+
+    private fun isConfirmedTransactionReply(info: RequestInfo, raw: List<Int>): Boolean {
+        if (info !is Command.Custom) return true
+        val reply = FrameCodec.decodeSingle(raw) ?: return false
+        return Command.isConfirmedReplyFrame(info.code, info.data, reply)
     }
 
     private fun dropFirst(all: List<Int>, sent: List<Int>): List<Int> {

@@ -39,10 +39,12 @@ import cn.tuodi.lockboard.core.testing.TestRunner
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -67,9 +69,15 @@ const val UNIDENTIFIED_USB = "USB?"
 enum class LinkStatus(val label: String) {
     DISCONNECTED("未连接"),
     CONNECTING("连接中"),
+    PROBING("通道已打开，探测板卡中…"),
+    NO_BOARD("通道已打开（未检测到板卡）"),
     CONNECTED("已连接"),
     DISCONNECTING("断开中"),
-    LOST("链路断开"),
+    LOST("链路断开");
+
+    /** True while a transport is open (probing, no board detected, or board confirmed online). */
+    val isOpen: Boolean get() = this == PROBING || this == NO_BOARD || this == CONNECTED
+    val editable: Boolean get() = this == DISCONNECTED || this == LOST
 }
 
 /** Which protocol the control page uses for its commands (the board speaks both). */
@@ -93,10 +101,11 @@ data class ScanEntry(
     val modbusVersion: Int?,
     val latencyMs: Long?,
     val error: String?,
+    val modbusException: Int? = null,
 ) {
     /** Online = at least one protocol answered with a confirmed reply. */
-    val online get() = privateVersion != null || modbusVersion != null
-    val bothProtocols get() = privateVersion != null && modbusVersion != null
+    val online get() = privateVersion != null || modbusVersion != null || modbusException != null
+    val bothProtocols get() = privateVersion != null && (modbusVersion != null || modbusException != null)
 }
 
 data class ScanState(
@@ -195,6 +204,8 @@ class AppController(
     private var client: LockBoardClient? = null
     private var simBus: SimulatedBus? = null
     private val sessionJobs = ArrayList<Job>()
+    private var probeJob: Job? = null
+    private var openNote: String? = null
     private var pollJob: Job? = null
     private var testJob: Job? = null
     private var testRunner: TestRunner? = null
@@ -255,11 +266,23 @@ class AppController(
     }
 
     /** Reads back carried outputs; reports what stays unverified and notices a broken link. */
-    private fun verifyCarried(c: LockBoardClient, keys: List<OutputKey>, title: String) {
+    private fun verifyCarried(
+        c: LockBoardClient,
+        keys: List<OutputKey>,
+        title: String,
+        onDone: ((Boolean) -> Unit)? = null,
+    ) {
         beginManual(title)
         scope.launch {
+            var anyConfirmed = false
             try {
-                for (a in keys.map { it.address }.distinct()) c.readOutputs(a)
+                for (a in keys.map { it.address }.distinct()) {
+                    val r = c.readOutputs(a)
+                    if (r is CommResult.Ok && r.confirmed) {
+                        anyConfirmed = true
+                        markBoardOnline(c, "地址 $a 读回成功")
+                    }
+                }
             } finally {
                 endManual()
             }
@@ -267,6 +290,7 @@ class AppController(
             _lastResult.value = if (open.isEmpty()) "遗留输出的登记均已清除（读回 0004 显示关断，或操作者现场确认）" else "遗留输出未能确认关断：${open.joinToString()}（读回失败或仍开启）"
             if (open.isNotEmpty()) toast("遗留输出未能确认关断：${open.joinToString()}")
             checkLink()
+            onDone?.invoke(anyConfirmed)
         }
     }
 
@@ -333,9 +357,122 @@ class AppController(
     // ------------------------------------------------------------------------------------------
     // Connection
 
+    private fun joinNotes(vararg parts: String?): String =
+        parts.mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }.joinToString("；")
+
+    private fun cancelProbeIfRunning(c: LockBoardClient) {
+        probeJob?.cancel()
+        probeJob = null
+        if (client === c && closing !== c && _link.value.status == LinkStatus.PROBING) {
+            _link.update {
+                it.copy(
+                    status = LinkStatus.NO_BOARD,
+                    message = joinNotes(openNote, "已中止自动探测，等待板卡回复"),
+                )
+            }
+        }
+    }
+
+    private fun markBoardOnline(c: LockBoardClient, detail: String? = null) {
+        if (client !== c || closing === c || !c.isOpen) return
+        val cur = _link.value
+        val desc = "${c.transportKind.label}：${c.transportDescription}"
+        if (cur.status == LinkStatus.PROBING || cur.status == LinkStatus.NO_BOARD) {
+            log.add(LogKind.INFO, "已连接 $desc${detail?.let { "；$it" } ?: ""}")
+            _link.value = LinkState(
+                status = LinkStatus.CONNECTED,
+                description = desc,
+                message = joinNotes(openNote, detail),
+                simulated = !c.transportKind.physical,
+            )
+        } else if (cur.status == LinkStatus.CONNECTED && detail != null) {
+            _link.update { it.copy(message = joinNotes(openNote, detail)) }
+        }
+    }
+
+    private fun markNoBoard(c: LockBoardClient, detail: String) {
+        if (client !== c || closing === c || !c.isOpen || !c.transportKind.physical) return
+        val desc = "${c.transportKind.label}：${c.transportDescription}"
+        _link.value = LinkState(
+            status = LinkStatus.NO_BOARD,
+            description = desc,
+            message = joinNotes(openNote, detail),
+            simulated = false,
+        )
+    }
+
+    private fun startAutoProbe(c: LockBoardClient) {
+        probeJob?.cancel()
+        val preferred = _board.value.address.takeIf { it in Protocol.MIN_ADDRESS..Protocol.MAX_ADDRESS }
+        val order = listOfNotNull(preferred) + (Protocol.MIN_ADDRESS..Protocol.MAX_ADDRESS).filter { it != preferred }
+        val t = config.value.scanTimeoutMs
+        val options = ExecOptions(timeoutMs = t, readRetries = 0, lateGuardMs = minOf(c.settings.lateReplyGuardMs, t, 50))
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                for ((idx, a) in order.withIndex()) {
+                    if (!currentCoroutineContext().isActive || client !== c || closing === c || !c.isOpen) return@launch
+                    _link.update {
+                        if (it.status == LinkStatus.PROBING) {
+                            it.copy(message = joinNotes(openNote, "正在探测地址 $a（${idx + 1}/${order.size}）…"))
+                        } else it
+                    }
+                    val p = c.execute(Command.GetVersion(a), options)
+                    if (!currentCoroutineContext().isActive || client !== c || closing === c) return@launch
+                    if (!c.isOpen) {
+                        checkLink()
+                        return@launch
+                    }
+                    val pv = p.confirmedReply()?.bytes
+                    if (pv != null) {
+                        val now = System.currentTimeMillis()
+                        _board.update { cur ->
+                            if (cur.address != a) BoardState(address = a, privateVersion = pv, updatedAtMillis = now)
+                            else cur.copy(privateVersion = pv, updatedAtMillis = now, lastError = null)
+                        }
+                        markBoardOnline(c, "检测到地址 $a 在线（私有 ${pv.toHex()}）")
+                        return@launch
+                    }
+                    if (a == preferred) {
+                        val m = c.executeModbus(ModbusRequest.ReadHoldingRegisters(a, Modbus.REG_VERSION, 1), options)
+                        if (!currentCoroutineContext().isActive || client !== c || closing === c) return@launch
+                        if (!c.isOpen) {
+                            checkLink()
+                            return@launch
+                        }
+                        val mReply = m.confirmedReply()
+                        val mv = (mReply as? ModbusReply.Registers)?.value(Modbus.REG_VERSION)
+                        val mEx = mReply as? ModbusReply.Exception
+                        if (mv != null || mEx != null) {
+                            val now = System.currentTimeMillis()
+                            _board.update { cur ->
+                                if (cur.address != a) BoardState(address = a, modbusVersion = mv, updatedAtMillis = now, lastError = mEx?.let { "MODBUS ${it.summary()}" })
+                                else cur.copy(modbusVersion = mv, updatedAtMillis = now, lastError = mEx?.let { "MODBUS ${it.summary()}" })
+                            }
+                            val detail = mv?.let { "MODBUS %04X".format(it) } ?: "MODBUS ${mEx!!.summary()}"
+                            markBoardOnline(c, "检测到地址 $a 在线（$detail）")
+                            return@launch
+                        }
+                    }
+                    if (!c.isOpen) {
+                        checkLink()
+                        return@launch
+                    }
+                }
+                if (currentCoroutineContext().isActive && client === c && closing !== c && c.isOpen && _link.value.status == LinkStatus.PROBING) {
+                    markNoBoard(c, "地址 1–15 均无回复；请检查 485 A/B 接线、板卡供电、波特率及设备节点")
+                    log.add(LogKind.WARN, "通道已打开，但探测地址 1–15 均无板卡回复（${c.transportDescription}）")
+                }
+            } finally {
+                if (probeJob === currentCoroutineContext()[Job]) probeJob = null
+            }
+        }
+        probeJob = job
+        job.start()
+    }
+
     fun connect() {
         val st = _link.value.status
-        if (st == LinkStatus.CONNECTING || st == LinkStatus.CONNECTED || st == LinkStatus.DISCONNECTING) return
+        if (st == LinkStatus.CONNECTING || st.isOpen || st == LinkStatus.DISCONNECTING) return
         _link.value = LinkState(LinkStatus.CONNECTING, config.value.connection.type.label)
         val seq = ++connectSeq
         scope.launch {
@@ -349,6 +486,7 @@ class AppController(
                 }
                 val safety = SafetyPolicy({ config.value.profile(it) }, { config.value.maxLockTimedSeconds })
                 val c = LockBoardClient(opened.transport, settingsFor(cfg, opened.transport.kind.physical), log, safety)
+                c.onConfirmedReply = { scope.launch { markBoardOnline(c) } }
                 val key = busKey(cfg, opened)
                 val inherited = if (key == UNIDENTIFIED_USB) null else carries.remove(key)
                 if (inherited != null && !inherited.isEmpty) c.importCarry(inherited)
@@ -356,6 +494,7 @@ class AppController(
                 if (isUsbKey(key)) carries.forEach { (k, v) -> if (isUsbKey(k)) c.importCarry(v.copy(outputs = emptyList())) }
                 busKeys[c] = key
                 client = c
+                openNote = opened.note
                 refreshPending()
                 if (_pendingCarries.value.isNotEmpty()) toast("其他 USB 适配器有遗留的可能带电输出，请在连接页处理")
                 simBus = opened.transport as? SimulatedBus
@@ -363,8 +502,13 @@ class AppController(
                 _scan.value = ScanState() // results of another bus must never become batch targets
                 _board.value = BoardState(address = _board.value.address)
                 val desc = "${c.transportKind.label}：${c.transportDescription}"
-                _link.value = LinkState(LinkStatus.CONNECTED, desc, opened.note ?: "", simulated = !c.transportKind.physical)
-                log.add(LogKind.INFO, "已连接 $desc${opened.note?.let { "；$it" } ?: ""}")
+                if (!c.transportKind.physical) {
+                    _link.value = LinkState(LinkStatus.CONNECTED, desc, opened.note ?: "", simulated = true)
+                    log.add(LogKind.INFO, "已连接 $desc${opened.note?.let { "；$it" } ?: ""}")
+                } else {
+                    _link.value = LinkState(LinkStatus.PROBING, desc, joinNotes(openNote, "正在探测在线板卡…"), simulated = false)
+                    log.add(LogKind.INFO, "已打开通道 $desc${opened.note?.let { "；$it" } ?: ""}，开始探测在线板卡")
+                }
                 sessionJobs += scope.launch { c.outputs.state.collect { _outputs.value = it } }
                 if (simBus != null) sessionJobs += scope.launch {
                     while (isActive) { _simStates.value = simBus?.boardStates() ?: emptyList(); delay(300) }
@@ -372,7 +516,13 @@ class AppController(
                 if (inherited != null && inherited.outputs.isNotEmpty()) {
                     log.add(LogKind.WARN, "上次会话未经读回确认关断的输出：${inherited.outputs.joinToString()}，正在读回核对")
                     toast("上次会话仍有可能带电的输出，正在读回核对")
-                    verifyCarried(c, inherited.outputs, "读回上次会话的输出")
+                    verifyCarried(c, inherited.outputs, "读回上次会话的输出") { anyConfirmed ->
+                        if (c.transportKind.physical && !anyConfirmed && client === c && closing !== c && c.isOpen && _link.value.status == LinkStatus.PROBING) {
+                            startAutoProbe(c)
+                        }
+                    }
+                } else if (c.transportKind.physical) {
+                    startAutoProbe(c)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -408,6 +558,7 @@ class AppController(
         if (closing === c) return
         closing = c
         c.safety.lockDown()
+        probeJob?.cancel(); probeJob = null
         _armed.value = emptySet()
         _link.update { it.copy(status = LinkStatus.DISCONNECTING) }
         scope.launch {
@@ -442,6 +593,8 @@ class AppController(
         }
         pollJob?.cancel(); pollJob = null
         _polling.value = false
+        probeJob?.cancel(); probeJob = null
+        openNote = null
         sessionJobs.forEach { it.cancel() }; sessionJobs.clear()
         client = null
         _pendingCarries.value = emptyList()
@@ -482,6 +635,7 @@ class AppController(
     fun scan() {
         val c = client ?: return toast("请先连接")
         if (activityRunning || _scan.value.running || manualInFlight > 0) return toast("有任务正在进行")
+        cancelProbeIfRunning(c)
         // Claim the bus synchronously, before any other request can be admitted.
         _scan.value = ScanState(running = true)
         pollJob?.cancel(); _polling.value = false
@@ -497,21 +651,37 @@ class AppController(
                     val m = c.executeModbus(ModbusRequest.ReadHoldingRegisters(a, Modbus.REG_VERSION, 1), options)
                     if (client !== c) return@launch
                     val pv = p.confirmedReply()?.bytes
-                    val mv = (m.confirmedReply() as? ModbusReply.Registers)?.value(Modbus.REG_VERSION)
+                    val mReply = m.confirmedReply()
+                    val mv = (mReply as? ModbusReply.Registers)?.value(Modbus.REG_VERSION)
+                    val mEx = (mReply as? ModbusReply.Exception)?.code
                     val err = listOfNotNull(
                         (p as? CommResult.Failed)?.let { "私有：${it.error.label}" },
                         (m as? CommResult.Failed)?.let { "MODBUS：${it.error.label}" },
+                        (mReply as? ModbusReply.Exception)?.let { "MODBUS：${it.summary()}" },
                     ).joinToString("；").ifEmpty { null }
-                    entries += ScanEntry(a, pv, mv, (p as? CommResult.Ok)?.latencyMs, if (pv != null || mv != null) err else "无回复")
+                    val onlineEntry = pv != null || mv != null || mEx != null
+                    entries += ScanEntry(
+                        address = a,
+                        privateVersion = pv,
+                        modbusVersion = mv,
+                        latencyMs = (p as? CommResult.Ok)?.latencyMs ?: (m as? CommResult.Ok)?.latencyMs,
+                        error = if (onlineEntry) err else "无回复",
+                        modbusException = mEx,
+                    )
                     _scan.update { it.copy(entries = entries.toList()) }
                     if (!c.isOpen) break
+                }
+                val online = entries.filter { it.online }
+                log.add(LogKind.INFO, "扫描完成：在线地址 ${online.joinToString(",") { it.address.toString() }.ifEmpty { "无" }}")
+                if (online.isNotEmpty()) {
+                    if (online.none { it.address == _board.value.address }) selectBoard(online.first().address)
+                    markBoardOnline(c, "在线 ${online.size} 块（地址 ${online.joinToString(",") { it.address.toString() }}）")
+                } else if (client === c && closing !== c && c.isOpen && c.transportKind.physical) {
+                    markNoBoard(c, "扫描完成：地址 1–15 均无回复；请检查 485 A/B 接线、板卡供电、波特率及设备节点")
                 }
             } finally {
                 if (client === c) _scan.update { it.copy(running = false, finishedAtMillis = System.currentTimeMillis()) }
             }
-            val online = entries.filter { it.online }
-            log.add(LogKind.INFO, "扫描完成：在线地址 ${online.joinToString(",") { it.address.toString() }.ifEmpty { "无" }}")
-            if (online.isNotEmpty() && online.none { it.address == _board.value.address }) selectBoard(online.first().address)
             checkLink()
         }
     }
@@ -525,23 +695,32 @@ class AppController(
     // ------------------------------------------------------------------------------------------
     // Control
 
-    private fun action(title: String, refreshAfter: Boolean, block: suspend (LockBoardClient, Int) -> CommResult<*>) {
+    private fun action(
+        title: String,
+        refreshAfter: Boolean,
+        expectedAddress: Int? = null,
+        block: suspend (LockBoardClient, Int) -> CommResult<*>,
+    ) {
         val c = client ?: return toast("请先连接")
         if (activityRunning) return toast("自动测试/寿命测试进行中，手动操作已禁用")
         if (_scan.value.running) return toast("总线扫描进行中")
         val address = _board.value.address
+        if (expectedAddress != null && expectedAddress != address) {
+            return toast("当前板已切换为地址 $address，请核对后重试")
+        }
+        cancelProbeIfRunning(c)
         beginManual(title)
         scope.launch {
             try {
                 val r = block(c, address)
                 _lastResult.value = r.describe()
-                apply(address, r)
+                apply(c, address, r)
                 if (r is CommResult.Failed) toast(r.describe())
                 if (refreshAfter && c.isOpen) {
                     // MODBUS pulses run in the background: read the feedback once the action window is over.
                     c.awaitPulseIdle(address)
                     delay(config.value.plan.settleMs.toLong())
-                    apply(address, c.execute(Command.ReadAll(address)))
+                    apply(c, address, c.execute(Command.ReadAll(address)))
                 }
             } finally {
                 endManual()
@@ -550,7 +729,10 @@ class AppController(
         }
     }
 
-    private fun apply(address: Int, r: CommResult<*>) {
+    private fun apply(c: LockBoardClient, address: Int, r: CommResult<*>) {
+        if (r is CommResult.Ok<*> && r.confirmed && r.reply !is ModbusReply.BroadcastSent) {
+            markBoardOnline(c)
+        }
         if (_board.value.address != address) return
         val now = System.currentTimeMillis()
         if (r is CommResult.Failed) {
@@ -589,64 +771,65 @@ class AppController(
 
     private val usesModbus get() = _protocol.value == ControlProtocol.MODBUS
 
-    fun readVersion() = action("读版本", false) { c, a ->
+    fun readVersion(expectedAddress: Int? = null) = action("读版本", false, expectedAddress) { c, a ->
         if (usesModbus) c.executeModbus(ModbusRequest.ReadHoldingRegisters(a, Modbus.REG_VERSION, 1)) else c.execute(Command.GetVersion(a))
     }
 
-    fun readAll() = action("读全部反馈", false) { c, a ->
+    fun readAll(expectedAddress: Int? = null) = action("读全部反馈", false, expectedAddress) { c, a ->
         if (usesModbus) c.executeModbus(ModbusRequest.ReadDiscreteInputs(a, 1, 12)) else c.execute(Command.ReadAll(a))
     }
 
-    fun readOne(ch: Int) = action("读第 $ch 路", false) { c, a ->
+    fun readOne(ch: Int, expectedAddress: Int? = null) = action("读第 $ch 路", false, expectedAddress) { c, a ->
         if (usesModbus) c.executeModbus(ModbusRequest.ReadDiscreteInputs(a, ch, 1)) else c.execute(Command.ReadOne(a, ch))
     }
 
-    fun unlock(ch: Int) = action("开第 $ch 路", true) { c, a ->
+    fun unlock(ch: Int, expectedAddress: Int? = null) = action("开第 $ch 路", true, expectedAddress) { c, a ->
         if (usesModbus) c.executeModbus(ModbusRequest.WriteSingleCoil(a, ch)) else c.execute(Command.UnlockOne(a, ch))
     }
 
-    fun unlockAll() = action("开全部锁", true) { c, a ->
+    fun unlockAll(expectedAddress: Int? = null) = action("开全部锁", true, expectedAddress) { c, a ->
         if (usesModbus) c.executeModbus(ModbusRequest.WriteMultipleCoils(a, 1, 12, Protocol.ALL_CHANNELS_MASK)) else c.execute(Command.UnlockAll(a))
     }
 
-    fun unlockMany(channels: Collection<Int>) = action("逐路开多个锁", true) { c, a ->
+    fun unlockMany(channels: Collection<Int>, expectedAddress: Int? = null) = action("逐路开多个锁", true, expectedAddress) { c, a ->
         val m = LockMask.of(channels)
         if (usesModbus) c.executeModbus(ModbusRequest.WriteMultipleCoils(a, 1, 12, m)) else c.execute(Command.UnlockMany(a, m))
     }
 
-    fun unlockSimultaneous(channels: Collection<Int>) = action("同时开多个锁", true) { c, a ->
+    fun unlockSimultaneous(channels: Collection<Int>, expectedAddress: Int? = null) = action("同时开多个锁", true, expectedAddress) { c, a ->
         val m = LockMask.of(channels)
         if (usesModbus) c.executeModbus(ModbusRequest.WriteSingleRegister(a, Modbus.REG_PULSE_LO, m)) else c.execute(Command.UnlockSimultaneous(a, m))
     }
 
-    fun setOutput(ch: Int, on: Boolean) = action("第 $ch 路持续输出${if (on) "开" else "关"}", false) { c, a ->
+    fun setOutput(ch: Int, on: Boolean, expectedAddress: Int? = null) = action("第 $ch 路持续输出${if (on) "开" else "关"}", false, expectedAddress) { c, a ->
         val r = if (usesModbus) c.executeModbus(ModbusRequest.WriteMultipleRegisters(a, Modbus.REG_SINGLE_CHANNEL, listOf(ch, if (on) 1 else 0)))
         else c.execute(Command.SetOutput(a, ch, on))
-        if (r is CommResult.Ok) apply(a, c.readOutputs(a))
+        if (r is CommResult.Ok) apply(c, a, c.readOutputs(a))
         r
     }
 
-    fun setOutputTimed(ch: Int, seconds: Int) = action("第 $ch 路定时输出 $seconds s", false) { c, a ->
+    fun setOutputTimed(ch: Int, seconds: Int, expectedAddress: Int? = null) = action("第 $ch 路定时输出 $seconds s", false, expectedAddress) { c, a ->
         val r = if (usesModbus) c.executeModbus(ModbusRequest.WriteMultipleRegisters(a, Modbus.REG_SINGLE_CHANNEL, listOf(ch, 1, seconds)))
         else c.execute(Command.SetOutputTimed(a, ch, seconds))
-        if (r is CommResult.Ok) apply(a, c.readOutputs(a))
+        if (r is CommResult.Ok) apply(c, a, c.readOutputs(a))
         r
     }
 
-    fun setOutputs(channels: Collection<Int>) = action("整体持续输出", false) { c, a ->
+    fun setOutputs(channels: Collection<Int>, expectedAddress: Int? = null) = action("整体持续输出", false, expectedAddress) { c, a ->
         val m = LockMask.of(channels)
         val r = if (usesModbus) c.executeModbus(ModbusRequest.WriteSingleRegister(a, Modbus.REG_OUTPUT_LO, m)) else c.execute(Command.SetOutputs(a, m))
-        if (r is CommResult.Ok) apply(a, c.readOutputs(a))
+        if (r is CommResult.Ok) apply(c, a, c.readOutputs(a))
         r
     }
 
     /** Trusted read-back of 0004 (MODBUS 03); clears registrations whose bit reads 0. */
-    fun readOutputs() = action("读回输出 0004", false) { c, a -> c.readOutputs(a) }
+    fun readOutputs(expectedAddress: Int? = null) = action("读回输出 0004", false, expectedAddress) { c, a -> c.readOutputs(a) }
 
     fun cleanupOutputs() {
         val c = client ?: return
         if (activityRunning) return toast("测试进行中：请先停止测试，测试会自行逐路关断并读回确认")
         if (_scan.value.running) return toast("总线扫描进行中")
+        cancelProbeIfRunning(c)
         beginManual("关断并读回确认")
         scope.launch {
             val res = try { c.cleanup() } finally { endManual() }
@@ -673,11 +856,12 @@ class AppController(
         if (!enabled) return
         if (activityRunning) return toast("测试进行中，不能轮询")
         if (_scan.value.running) return toast("总线扫描进行中，不能轮询")
+        cancelProbeIfRunning(c)
         _polling.value = true
         pollJob = scope.launch {
             while (isActive && c.isOpen && !activityRunning && !_scan.value.running) {
                 val a = _board.value.address
-                apply(a, if (usesModbus) c.executeModbus(ModbusRequest.ReadDiscreteInputs(a, 1, 12)) else c.execute(Command.ReadAll(a)))
+                apply(c, a, if (usesModbus) c.executeModbus(ModbusRequest.ReadDiscreteInputs(a, 1, 12)) else c.execute(Command.ReadAll(a)))
                 checkLink()
                 delay(config.value.pollIntervalMs.toLong())
             }
@@ -718,6 +902,7 @@ class AppController(
         if (activityRunning) return toast("测试进行中")
         if (_scan.value.running) return toast("总线扫描进行中")
         frameError(address, command, dataHex)?.let { return toast(it) }
+        cancelProbeIfRunning(c)
         val data = parseHex(dataHex)
         beginManual("终端发送")
         scope.launch {
@@ -740,6 +925,7 @@ class AppController(
         frameError(address, function, payloadHex)?.let { return toast(it) }
         val req = ModbusRequest.fromFrame(cn.tuodi.lockboard.core.modbus.Crc16.append(listOf(address, function) + parseHex(payloadHex)))
             ?: return toast("无法构造 MODBUS 帧")
+        cancelProbeIfRunning(c)
         beginManual("终端 MODBUS 发送")
         scope.launch {
             try {
@@ -747,7 +933,7 @@ class AppController(
                     ex.rejected?.let { "已拒绝：$it" } ?: (ex.modbusReply?.summary() ?: "无回复")
                 } else {
                     val res = c.executeModbus(req, ExecOptions(broadcastConfirmed = broadcastConfirmed))
-                    apply(address, res)
+                    apply(c, address, res)
                     res.describe()
                 }
                 _lastResult.value = r
@@ -763,6 +949,7 @@ class AppController(
         if (activityRunning) return toast("测试进行中")
         if (_scan.value.running) return toast("总线扫描进行中")
         val bytes = try { parseHex(hex) } catch (e: IllegalArgumentException) { return toast("HEX 格式错误：${e.message}") }
+        cancelProbeIfRunning(c)
         beginManual("原始发送")
         scope.launch {
             val ex = try { c.sendRaw(bytes, listenMs.coerceIn(50, 10_000), broadcastConfirmed) } finally { endManual() }
@@ -826,6 +1013,7 @@ class AppController(
         val c = client ?: return toast("请先连接")
         if (activityRunning || _scan.value.running || manualInFlight > 0) return toast("有任务正在进行")
         if (targets.isEmpty()) return toast("没有测试对象：请先扫描总线")
+        cancelProbeIfRunning(c)
         if (armOutputs) targets.filter { config.value.profile(it).channelsOf(ChannelType.OUTPUT).isNotEmpty() }.forEach { arm(it) }
         togglePolling(false)
         val lines = ArrayList<String>()
@@ -878,12 +1066,14 @@ class AppController(
         _prompt.value?.answer?.complete(Answer.SKIP)
     }
 
-    fun startEndurance(channels: List<Int>, cycles: Int, intervalMs: Int) {
+    fun startEndurance(channels: List<Int>, cycles: Int, intervalMs: Int, address: Int = _board.value.address) {
         val c = client ?: return toast("请先连接")
         if (activityRunning || _scan.value.running || manualInFlight > 0) return toast("有任务正在进行")
+        if (address != _board.value.address) return toast("当前板已切换为地址 ${_board.value.address}，请核对通道后重试")
         if (channels.isEmpty()) return toast("请选择通道")
+        cancelProbeIfRunning(c)
         togglePolling(false)
-        val plan = EndurancePlan(_board.value.address, channels, cycles, intervalMs, config.value.plan.settleMs)
+        val plan = EndurancePlan(address, channels, cycles, intervalMs, config.value.plan.settleMs)
         val file = File(exportDir, "endurance-${stamp()}.txt")
         val runner = EnduranceRunner(c, plan) { st ->
             _endurance.update { it.copy(status = st) }

@@ -51,8 +51,8 @@ fun ConnectScreen(controller: AppController, usb: UsbAdapters?) {
     val outputs by controller.outputs.collectAsStateWithLifecycle()
     val pending by controller.pendingCarries.collectAsStateWithLifecycle()
     var askDiscard by remember { mutableStateOf<PendingCarry?>(null) }
-    val connected = link.status == LinkStatus.CONNECTED
-    val editable = link.status == LinkStatus.DISCONNECTED || link.status == LinkStatus.LOST
+    val linkOpen = link.status.isOpen
+    val editable = link.status.editable
     var askDisconnect by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
@@ -94,20 +94,31 @@ fun ConnectScreen(controller: AppController, usb: UsbAdapters?) {
 
         SectionCard("连接") {
             Text("状态：${link.status.label}", fontWeight = FontWeight.Bold,
-                color = when (link.status) { LinkStatus.CONNECTED -> OpenColor; LinkStatus.LOST -> FailColor; else -> MaterialTheme.colorScheme.onSurface })
+                modifier = Modifier.testTag("connectStatus"),
+                color = when (link.status) {
+                    LinkStatus.CONNECTED -> OpenColor
+                    LinkStatus.NO_BOARD -> WarnColor
+                    LinkStatus.LOST -> FailColor
+                    else -> MaterialTheme.colorScheme.onSurface
+                })
+            if (link.status == LinkStatus.PROBING) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
+            }
             if (link.description.isNotBlank()) Text(link.description)
-            if (link.message.isNotBlank()) Hint(link.message)
+            if (link.message.isNotBlank()) {
+                Hint(link.message, if (link.status == LinkStatus.NO_BOARD) WarnColor else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
                 Button(onClick = { controller.connect() }, enabled = editable, modifier = Modifier.testTag("connect")) { Text("连接") }
                 OutlinedButton(
                     onClick = { if (outputs.isNotEmpty()) askDisconnect = true else controller.disconnect() },
-                    enabled = connected || link.status == LinkStatus.CONNECTING,
+                    enabled = linkOpen || link.status == LinkStatus.CONNECTING,
                     modifier = Modifier.testTag("disconnect"),
                 ) { Text("断开") }
             }
         }
 
-        if (connected && pending.isNotEmpty()) SectionCard("其他 USB 适配器遗留的可能带电输出") {
+        if (linkOpen && pending.isNotEmpty()) SectionCard("其他 USB 适配器遗留的可能带电输出") {
             Hint("无法确认这些输出所在的总线是否就是当前总线。是同一条总线时带入并读回核对；否则请回到原总线处理或现场确认断电。", FailColor)
             pending.forEach { p ->
                 Text("${p.label}：${p.outputs.joinToString()}", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 6.dp))
@@ -119,7 +130,7 @@ fun ConnectScreen(controller: AppController, usb: UsbAdapters?) {
         }
 
         SectionCard("总线扫描（地址 1–15，私有 0x01 + MODBUS 03 读 0001）") {
-            Button(onClick = { controller.scan() }, enabled = connected && !scan.running, modifier = Modifier.testTag("scan")) {
+            Button(onClick = { controller.scan() }, enabled = linkOpen && !scan.running, modifier = Modifier.testTag("scan")) {
                 Text(if (scan.running) "扫描中… 地址 ${scan.current}" else "扫描总线")
             }
             if (scan.running) LinearProgressIndicator(progress = { scan.current / 15f }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
@@ -136,7 +147,10 @@ fun ConnectScreen(controller: AppController, usb: UsbAdapters?) {
                         Column(Modifier.weight(1f)) {
                             Text(
                                 "地址 ${e.address}  " + if (online) {
-                                    "在线  私有 ${e.privateVersion?.toHex() ?: "无回复"} · MODBUS ${e.modbusVersion?.let { "%04X".format(it) } ?: "无回复"}"
+                                    val modbusText = e.modbusVersion?.let { "%04X".format(it) }
+                                        ?: e.modbusException?.let { "异常 %02X".format(it) }
+                                        ?: "无回复"
+                                    "在线  私有 ${e.privateVersion?.toHex() ?: "无回复"} · MODBUS $modbusText"
                                 } else "无回复",
                                 color = if (online) MaterialTheme.colorScheme.onSurface else UnknownColor,
                             )

@@ -37,6 +37,8 @@ import cn.tuodi.lockboard.core.config.ChannelType
 import cn.tuodi.lockboard.core.testing.ReportFormatter
 import cn.tuodi.lockboard.core.testing.TestPlan
 
+private data class TestPreview(val targets: List<Int>, val lines: List<String>)
+
 @Composable
 fun TestScreen(controller: AppController) {
     val cfg by controller.config.collectAsStateWithLifecycle()
@@ -48,10 +50,10 @@ fun TestScreen(controller: AppController) {
     val armed by controller.armed.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val plan = cfg.plan
-    val connected = link.status == LinkStatus.CONNECTED
+    val linkOpen = link.status.isOpen
     val busy = test.running || endurance.running
     var allBoards by remember { mutableStateOf(false) }
-    var preview by remember { mutableStateOf<List<String>?>(null) }
+    var preview by remember { mutableStateOf<TestPreview?>(null) }
     var showFull by remember { mutableStateOf(false) }
 
     fun setPlan(t: (TestPlan) -> TestPlan) = controller.updateConfig { it.copy(plan = t(it.plan).validated()) }
@@ -118,13 +120,17 @@ fun TestScreen(controller: AppController) {
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
-                onClick = { preview = controller.previewTest(controller.testTargets(allBoards)) },
-                enabled = connected && !busy && !scan.running && (!allBoards || scan.online.isNotEmpty()),
+                onClick = {
+                    val targets = controller.testTargets(allBoards)
+                    preview = TestPreview(targets, controller.previewTest(targets))
+                },
+                enabled = linkOpen && !busy && !scan.running && (!allBoards || scan.online.isNotEmpty()),
                 modifier = Modifier.testTag("startTest"),
             ) { Text("开始自动测试") }
             OutlinedButton(onClick = { controller.stopTest() }, enabled = test.running, modifier = Modifier.testTag("stopTest")) { Text("停止") }
         }
-        if (!link.simulated && connected) Hint("真实总线：测试会实际开锁和上电，请确保现场安全。")
+        if (link.status == LinkStatus.NO_BOARD) Hint("当前尚未检测到在线板卡，建议先检查物理接线并在“连接”页扫描总线。", WarnColor)
+        if (!link.simulated && linkOpen) Hint("真实总线：测试会实际开锁和上电，请确保现场安全。")
 
         if (test.lines.isNotEmpty()) {
             SectionCard(if (test.running) "测试进行中…" else "测试过程") {
@@ -156,21 +162,21 @@ fun TestScreen(controller: AppController) {
             }
         }
 
-        EnduranceSection(controller, connected, busy, endurance, board.address)
+        EnduranceSection(controller, linkOpen, busy, endurance, board.address)
     }
 
-    preview?.let { lines ->
-        val targets = controller.testTargets(allBoards)
+    preview?.let { p ->
+        val targets = p.targets
         val needArm = plan.outputSingle || plan.outputMulti
         val outputBoards = targets.filter { cfg.profile(it).channelsOf(ChannelType.OUTPUT).isNotEmpty() }
         val unarmed = outputBoards.filter { it !in armed }
-        var armNow by remember { mutableStateOf(false) }
+        var armNow by remember(p) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { preview = null },
             title = { Text("即将执行的动作") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
-                    lines.ifEmpty { listOf("（只执行只读测试项）") }.forEach { Text(it) }
+                    p.lines.ifEmpty { listOf("（只执行只读测试项）") }.forEach { Text(it) }
                     if (needArm && unarmed.isNotEmpty()) {
                         LabeledCheckbox("我已核对地址 ${unarmed.joinToString(",")} 的接线档案：灯/继电器通道未接电控锁，允许持续上电", armNow) { armNow = it }
                         Hint("不勾选则跳过 T7/T8")
@@ -204,7 +210,7 @@ private fun EnduranceSection(
         }
         Hint("每次开锁前读取反馈：只有“关→开”才计为已验证动作；门未关回时计为未验证。")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { controller.startEndurance(channels.sorted(), cfg.enduranceCycles, cfg.enduranceIntervalMs) }, enabled = connected && !busy) { Text("开始寿命测试") }
+            Button(onClick = { controller.startEndurance(channels.sorted(), cfg.enduranceCycles, cfg.enduranceIntervalMs, address) }, enabled = connected && !busy) { Text("开始寿命测试") }
             OutlinedButton(onClick = { controller.stopEndurance() }, enabled = st.running) { Text("停止") }
             st.file?.takeIf { it.exists() }?.let { f -> TextButton(onClick = { shareFile(context, f) }) { Text("分享") } }
         }

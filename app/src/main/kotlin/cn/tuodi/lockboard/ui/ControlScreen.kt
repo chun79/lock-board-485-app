@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -65,14 +66,15 @@ fun ControlScreen(controller: AppController) {
     val test by controller.test.collectAsStateWithLifecycle()
     val endurance by controller.endurance.collectAsStateWithLifecycle()
     val profile = cfg.profile(board.address)
-    val connected = link.status == LinkStatus.CONNECTED
+    val linkOpen = link.status.isOpen
     val locked = test.running || endurance.running
-    val enabled = connected && !locked
+    val enabled = linkOpen && !locked
     val outputChannels = profile.channelsOf(ChannelType.OUTPUT)
     val isArmed = board.address in armed
     var selection by remember { mutableStateOf(emptySet<Int>()) }
     var pending by remember { mutableStateOf<Pending?>(null) }
     var timedSeconds by remember { mutableIntStateOf(5) }
+    LaunchedEffect(board.address) { pending = null }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
         SectionCard("当前板") {
@@ -92,14 +94,18 @@ fun ControlScreen(controller: AppController) {
                 }
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                OutlinedButton(onClick = { controller.readVersion() }, enabled = enabled) { Text("读版本") }
-                OutlinedButton(onClick = { controller.readAll() }, enabled = enabled, modifier = Modifier.testTag("readAll")) {
+                OutlinedButton(onClick = { controller.readVersion(board.address) }, enabled = enabled) { Text("读版本") }
+                OutlinedButton(onClick = { controller.readAll(board.address) }, enabled = enabled, modifier = Modifier.testTag("readAll")) {
                     Text(if (protocol == ControlProtocol.MODBUS) "读反馈 02" else "读反馈 0x12")
                 }
             }
             LabeledSwitch("自动轮询反馈（每 ${cfg.pollIntervalMs} ms）", polling, enabled = enabled) { controller.togglePolling(it) }
             if (locked) Hint("自动测试或寿命测试进行中，手动操作已禁用", WarnColor)
-            if (!connected) Hint("未连接：请先在“连接”页连接总线", WarnColor)
+            when {
+                !linkOpen -> Hint("未连接：请先在“连接”页连接总线", WarnColor)
+                link.status == LinkStatus.PROBING -> Hint("通道已打开，正在探测在线板卡…")
+                link.status == LinkStatus.NO_BOARD -> Hint("通道已打开，但尚未检测到在线板卡；请检查接线、供电与串口参数，收到板卡回复后将转为“已连接”", WarnColor)
+            }
         }
 
         if (lastResult.isNotBlank() || busy != null) {
@@ -125,8 +131,8 @@ fun ControlScreen(controller: AppController) {
                 }
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                OutlinedButton(onClick = { controller.readOutputs() }, enabled = enabled, modifier = Modifier.testTag("readOutputs")) { Text("读回 0004") }
-                Button(onClick = { controller.cleanupOutputs() }, enabled = connected && outputs.isNotEmpty(), modifier = Modifier.testTag("cleanup")) { Text("逐路关断并读回确认") }
+                OutlinedButton(onClick = { controller.readOutputs(board.address) }, enabled = enabled, modifier = Modifier.testTag("readOutputs")) { Text("读回 0004") }
+                Button(onClick = { controller.cleanupOutputs() }, enabled = linkOpen && outputs.isNotEmpty(), modifier = Modifier.testTag("cleanup")) { Text("逐路关断并读回确认") }
             }
             if (outputChannels.isNotEmpty()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -144,11 +150,12 @@ fun ControlScreen(controller: AppController) {
                 Text(if (isArmed) "本次连接已确认，允许上电输出" else "尚未确认：上电输出指令将被拒绝", color = if (isArmed) OpenColor else WarnColor)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
+                        val addr = board.address
                         pending = Pending("确认接线档案",
-                            "请到现场核对：地址 ${board.address} 的第 ${outputChannels.joinToString(",")} 路接的是灯/继电器等可长时间通电的负载，" +
-                                "没有接电控锁。持续通电会烧坏电控锁。") { controller.arm(board.address) }
-                    }, enabled = connected && !isArmed, modifier = Modifier.testTag("arm")) { Text("确认接线") }
-                    OutlinedButton(onClick = { controller.disarm(board.address) }, enabled = connected && isArmed) { Text("撤销") }
+                            "请到现场核对：地址 $addr 的第 ${outputChannels.joinToString(",")} 路接的是灯/继电器等可长时间通电的负载，" +
+                                "没有接电控锁。持续通电会烧坏电控锁。") { controller.arm(addr) }
+                    }, enabled = linkOpen && !isArmed, modifier = Modifier.testTag("arm")) { Text("确认接线") }
+                    OutlinedButton(onClick = { controller.disarm(board.address) }, enabled = linkOpen && isArmed) { Text("撤销") }
                 }
             }
         }
@@ -187,19 +194,25 @@ fun ControlScreen(controller: AppController) {
             val sel = selection.sorted()
             val modbus = protocol == ControlProtocol.MODBUS
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button(onClick = { controller.unlockMany(sel) }, enabled = enabled && sel.isNotEmpty(), modifier = Modifier.testTag("unlockMany")) {
+                Button(onClick = { controller.unlockMany(sel, board.address) }, enabled = enabled && sel.isNotEmpty(), modifier = Modifier.testTag("unlockMany")) {
                     Text(if (modbus) "逐路开 0F" else "逐路开 0x15")
                 }
                 Button(onClick = {
-                    pending = Pending("同时开多个锁", "第 ${sel.joinToString(",")} 路将同时通电约 300 ms，瞬时电流叠加，请确认电源容量。") { controller.unlockSimultaneous(sel) }
+                    val addr = board.address
+                    pending = Pending("同时开多个锁", "地址 $addr 第 ${sel.joinToString(",")} 路将同时通电约 300 ms，瞬时电流叠加，请确认电源容量。") {
+                        controller.unlockSimultaneous(sel, addr)
+                    }
                 }, enabled = enabled && sel.isNotEmpty()) { Text(if (modbus) "同时开 0006" else "同时开 0x18") }
-                Button(onClick = { controller.setOutputs(sel) }, enabled = enabled && sel.isNotEmpty() && isArmed) {
+                Button(onClick = { controller.setOutputs(sel, board.address) }, enabled = enabled && sel.isNotEmpty() && isArmed) {
                     Text(if (modbus) "整体输出 0004" else "整体输出 0x1A")
                 }
-                OutlinedButton(onClick = { controller.setOutputs(emptyList()) }, enabled = enabled) { Text("输出全关") }
+                OutlinedButton(onClick = { controller.setOutputs(emptyList(), board.address) }, enabled = enabled) { Text("输出全关") }
                 Button(onClick = {
+                    val addr = board.address
                     pending = Pending("开全部锁",
-                        "全部 12 路逐路脉冲（含灯/继电器 ${outputChannels.joinToString(",").ifEmpty { "无" }} 与未使用通道），每路最长约 1.4 s。") { controller.unlockAll() }
+                        "地址 $addr 全部 12 路逐路脉冲（含灯/继电器 ${outputChannels.joinToString(",").ifEmpty { "无" }} 与未使用通道），每路最长约 1.4 s。") {
+                        controller.unlockAll(addr)
+                    }
                 }, enabled = enabled, modifier = Modifier.testTag("unlockAll")) { Text(if (modbus) "开全部 0F" else "开全部 0x14") }
             }
             Hint("整体输出写入覆盖全部 12 路：未选中的通道会被关闭，并取消所有单路定时（文档 4.9 / MODBUS 第 6 章）。只有已确认接线的灯/继电器通道能被开启。")
@@ -238,17 +251,17 @@ private fun ChannelCard(
             if (readbackOn == true) Hint("● 0004 读回：持续输出开", WarnColor)
             simOutput?.let { (on, timer) -> if (on == true) Hint("模拟负载通电" + (timer?.let { "，剩 ${it / 1000.0} s" } ?: ""), WarnColor) }
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = { controller.unlock(ch) }, enabled = enabled, modifier = Modifier.testTag("unlock_$ch")) { Text("开锁") }
-                TextButton(onClick = { controller.readOne(ch) }, enabled = enabled) { Text("读") }
+                TextButton(onClick = { controller.unlock(ch, address) }, enabled = enabled, modifier = Modifier.testTag("unlock_$ch")) { Text("开锁") }
+                TextButton(onClick = { controller.readOne(ch, address) }, enabled = enabled) { Text("读") }
             }
             if (type == ChannelType.OUTPUT) {
                 Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    TextButton(onClick = { controller.setOutput(ch, true) }, enabled = enabled, modifier = Modifier.testTag("outOn_$ch")) { Text("开") }
-                    TextButton(onClick = { controller.setOutput(ch, false) }, enabled = enabled, modifier = Modifier.testTag("outOff_$ch")) { Text("关") }
-                    TextButton(onClick = { controller.setOutputTimed(ch, timedSeconds) }, enabled = enabled, modifier = Modifier.testTag("outTimed_$ch")) { Text("定时") }
+                    TextButton(onClick = { controller.setOutput(ch, true, address) }, enabled = enabled, modifier = Modifier.testTag("outOn_$ch")) { Text("开") }
+                    TextButton(onClick = { controller.setOutput(ch, false, address) }, enabled = enabled, modifier = Modifier.testTag("outOff_$ch")) { Text("关") }
+                    TextButton(onClick = { controller.setOutputTimed(ch, timedSeconds, address) }, enabled = enabled, modifier = Modifier.testTag("outTimed_$ch")) { Text("定时") }
                 }
             } else if (type == ChannelType.LOCK) {
-                TextButton(onClick = { controller.setOutputTimed(ch, timedSeconds) }, enabled = enabled) { Text("定时通电 $timedSeconds s", color = Color.Gray) }
+                TextButton(onClick = { controller.setOutputTimed(ch, timedSeconds, address) }, enabled = enabled) { Text("定时通电 $timedSeconds s", color = Color.Gray) }
             }
             if (simulated && state == "打开") {
                 TextButton(onClick = { controller.simCloseDoor(address, ch) }) { Text("模拟关门", color = Color.Gray) }
