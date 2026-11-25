@@ -216,13 +216,14 @@ interface Reply {
     fun summary(): String
 }
 
-/** 0x01 reply [version, reserved]; the current firmware answers 02 00. */
+/** 0x01 reply [version, reserved]; the 2026-10-06 document baseline is 02 00 (newer firmware such as 03 00 is compatible). */
 data class VersionReply(val version: Int, val reserved: Int) : Reply {
     val bytes get() = listOf(version, reserved)
     override fun summary() = "版本 ${version.hex2()} ${reserved.hex2()}"
 
     companion object {
-        const val EXPECTED_VERSION = 0x02
+        const val MIN_VERSION = 0x02
+        const val EXPECTED_VERSION = MIN_VERSION
     }
 }
 

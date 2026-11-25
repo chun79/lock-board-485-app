@@ -216,7 +216,7 @@ def svg_safety_workflow() -> str:
   <text x="196" y="64" font-size="11" font-weight="700" fill="#0D47A1">连接并扫描</text>
   <text x="174" y="83" font-size="9.5" fill="#1E3A8A">选 USB/串口/TCP</text>
   <text x="174" y="96" font-size="9.5" fill="#1E3A8A">扫描 1–15 地址，核对</text>
-  <text x="174" y="109" font-size="9.5" fill="#1E3A8A">私有 0200 / MB 0002</text>
+  <text x="174" y="109" font-size="9.5" fill="#1E3A8A">私有 ≥0200 / MB ≥0002</text>
 
   <!-- Step 3 -->
   <rect x="314" y="44" width="134" height="74" rx="8" fill="#FFF7ED" stroke="#E65100" stroke-width="1.8"/>
@@ -765,7 +765,7 @@ def build_html() -> str:
   </div>
 
   <div class="cover-footer">
-    <span>版本：1.0.2 · Copyright © 2026 郭春良 · 项目与反馈：https://github.com/chun79/lock-board-485-app</span>
+    <span>版本：1.0.3 · Copyright © 2026 郭春良 · 项目与反馈：https://github.com/chun79/lock-board-485-app</span>
     <span>许可证：Apache License 2.0</span>
   </div>
 </div>
@@ -849,7 +849,7 @@ def build_html() -> str:
     <tr><th style="width:14%">底部页签</th><th style="width:36%">核心功能</th><th style="width:50%">现场典型用途</th></tr>
   </thead>
   <tbody>
-    <tr><td><strong>连接</strong></td><td>选择 USB / 串口 / TCP / 模拟器链路，连接并扫描地址 1–15</td><td>建立通信连接、核对双协议版本（私有 02 00 / MODBUS 0002）、处理异常断线遗留输出</td></tr>
+    <tr><td><strong>连接</strong></td><td>选择 USB / 串口 / TCP / 模拟器链路，连接并扫描地址 1–15</td><td>建立通信连接、核对双协议版本（私有 ≥ 02 00 / MODBUS ≥ 0002 且一致）、处理异常断线遗留输出</td></tr>
     <tr><td><strong>控制</strong></td><td>单路开锁、读反馈、灯/继电器持续与定时通电、批量操作</td><td>点对点核验每扇门锁弹开与反馈极性、开关柜灯、人工清账断电</td></tr>
     <tr><td><strong>测试</strong></td><td>一键自动执行 T0–T11 / M3–M7 / X1–X2 与寿命循环测试</td><td>整柜或整板出厂/进场验收，导出 TXT / JSON 验收报告</td></tr>
     <tr><td><strong>终端</strong></td><td>构造私有帧 / MODBUS 帧 / 原始 HEX，实时彩色通讯日志</td><td>协议级抓包排查、异常帧响应验证、导出完整通讯流水日志</td></tr>
@@ -921,7 +921,7 @@ def build_html() -> str:
       </li>
       <li><span class="step-badge">2</span><div><strong>连接</strong>：点击 <strong>连接</strong>，顶部与状态栏变为绿色“已连接”。</div></li>
       <li><span class="step-badge">3</span><div><strong>扫描总线</strong>：点击 <strong>扫描总线</strong>，App 会依次用私有 <code>0x01</code> 与 MODBUS <code>03(0001)</code> 探测地址 1–15，列出在线板卡及其双协议版本号。</div></li>
-      <li><span class="step-badge green">4</span><div><strong>核对版本并选定板卡</strong>：文档规定的标准版本为 <strong>私有 <code>02 00</code>、MODBUS <code>0002</code></strong>。若某块板提示“只有一种协议回复，与文档不符”，请核查板卡固件版本或通信干扰。点击列表项即可选中该板作为当前控制对象。</div></li>
+      <li><span class="step-badge green">4</span><div><strong>核对版本并选定板卡</strong>：2026-10-06 文档基准版本为 <strong>私有 ≥ <code>02 00</code>（预留 00）、MODBUS ≥ <code>0002</code> 且双方一致</strong>（高版本固件如 <code>03 00 / 0003</code> 兼容）。若某块板提示“只有一种协议回复，与文档不符”，请核查板卡固件版本或通信干扰。点击列表项即可选中该板作为当前控制对象。</div></li>
     </ul>
   </div>
 </div>
@@ -1054,9 +1054,9 @@ def build_html() -> str:
     <tr><th style="width:20%">场景</th><th style="width:28%">构造方式 / 示例帧</th><th style="width:52%">说明与安全检查结果</th></tr>
   </thead>
   <tbody>
-    <tr><td><strong>私有读版本</strong></td><td><code>DC 02 01 01 00 02</code></td><td>指令 <code>0x01</code>，数据段留空；正常回复 <code>DC FE 01 01 02 02 00 ...</code>（版本 02 00）。</td></tr>
+    <tr><td><strong>私有读版本</strong></td><td><code>DC 02 01 01 00 02</code></td><td>指令 <code>0x01</code>，数据段留空；正常回复 <code>DC FE 01 01 02 VV 00 ...</code>（基准 <code>02 00</code>，高版本如 <code>03 00</code> 兼容）。</td></tr>
     <tr><td><strong>私有开第 1 路</strong></td><td><code>DC 02 01 10 01 01 13</code></td><td>指令 <code>0x10</code>，数据段 <code>01</code>；在 0.35–1.4 s 动作结束后回复结果。</td></tr>
-    <tr><td><strong>MODBUS 读版本</strong></td><td><code>01 03 00 01 00 01 D5 CA</code></td><td>功能码 <code>03</code>，数据 <code>00 01 00 01</code>；正常返回版本寄存器 <code>0002</code>。</td></tr>
+    <tr><td><strong>MODBUS 读版本</strong></td><td><code>01 03 00 01 00 01 D5 CA</code></td><td>功能码 <code>03</code>，数据 <code>00 01 00 01</code>；正常返回版本寄存器 ≥ <code>0002</code>（如 <code>0002</code> / <code>0003</code>）。</td></tr>
     <tr><td><strong>MODBUS 读输出字</strong></td><td><code>01 03 00 04 00 02 85 CA</code></td><td>读取寄存器 <code>0004–0005</code>，用于确认持续/定时输出状态（低 12 位有效）。</td></tr>
     <tr><td><strong style="color:#C62828;">禁止写 0005</strong></td><td><code>01 06 00 05 00 00 ...</code></td><td><strong style="color:#C62828;">直接拒绝</strong>：单独写 <code>0005</code> 会取消所有单路定时并将已通电通道转为一直通电。</td></tr>
   </tbody>
@@ -1117,7 +1117,7 @@ def build_html() -> str:
   <tbody>
     <tr><td><strong>扫描不到任何板卡</strong></td><td>① 检查 RS485 A/B 线是否接反或接触不良；② 确认板卡拨码地址在 1–15 之间（不能全 OFF）；③ 核对串口参数为 <code>9600 8N1</code>；④ 若使用 TCP 网关，确认其工作在 <strong>TCP Server 透传模式</strong>。</td></tr>
     <tr><td><strong>两块板回复混乱、校验错</strong></td><td>同一总线上存在拨码地址重复的板卡，请逐块检查拨码开关并重新上电或重扫。</td></tr>
-    <tr><td><strong>提示“只有一种协议回复”</strong></td><td>板卡固件与 2026-10-06 双协议规范不符（正常应同时回复私有 <code>02 00</code> 与 MODBUS <code>0002</code>），请核实固件版本或排查总线干扰。</td></tr>
+    <tr><td><strong>提示“只有一种协议回复”</strong></td><td>板卡固件与 2026-10-06 双协议规范不符（正常应同时回复私有 ≥ <code>02 00</code> 与 MODBUS ≥ <code>0002</code> 且双方一致），请核实固件版本或排查总线干扰。</td></tr>
     <tr><td><strong>提示“回复归属不明”</strong></td><td>更早发出的同类请求回复迟到了（03 读回复内容不带起始地址），App 为防止错位不将其当成本次结果，稍后重新读取即可。</td></tr>
     <tr><td><strong>开锁提示“结果未知”</strong></td><td>动作指令等待超时。为防止重复开锁引发二次弹门，App <strong>永不自动重发动作指令</strong>。请手动“读”反馈或到现场确认门锁实际状态。</td></tr>
     <tr><td><strong>持续通电指令被拒绝</strong></td><td>① 该通道档案为“电控锁”或“未使用”；② 本次连接尚未在控制页点“确认接线”（或改过档案导致确认撤销）；③ 试图单独写 <code>0005</code>/<code>0007</code> 或广播上电。</td></tr>
@@ -1133,7 +1133,7 @@ def build_html() -> str:
   </thead>
   <tbody>
     <tr><td><strong>链路</strong></td><td>A1–A6（USB / 串口 / TCP / 回显）</td><td>USB 授权及拔出断链检测正常；板载串口读写正常；TCP 透传下 MODBUS 帧不被网关拆包；回显适配器打开过滤后 05/06 正常。</td></tr>
-    <tr><td><strong>协议</strong></td><td>B1–B3（版本、极性与位映射）</td><td>版本确认私有 <code>02 00</code>、MODBUS <code>0002</code>；人工开关门验证 <code>1 = 打开</code>；单独开第 1、8、9、12 路，确认物理端子与通道号一一对应。</td></tr>
+    <tr><td><strong>协议</strong></td><td>B1–B3（版本、极性与位映射）</td><td>版本确认私有 ≥ <code>02 00</code>（预留 00）、MODBUS ≥ <code>0002</code> 且双方一致；人工开关门验证 <code>1 = 打开</code>；单独开第 1、8、9、12 路，确认物理端子与通道号一一对应。</td></tr>
     <tr><td><strong>时序</strong></td><td>B4–B8（耗时、节流、定时精度）</td><td>实测 T3 单路 0x10 耗时落在 0.35–1.4 s；终端连发两次 05 间隔 ≥ 动作窗口；实测定时断电偏差在容差内且 X1/X2 跨协议覆盖正确。</td></tr>
     <tr><td><strong>功能</strong></td><td>C1–C5（开锁、输出与收尾清账）</td><td>开启“人工确认物理动作”跑通 T3/M3/T4/M4/T5/M5/T6；接灯跑通 T7/T8/T11/M6；电控锁通道尝试持续输出全部被拒；停止或断开后读回 <code>0004 = 0</code>。</td></tr>
     <tr><td><strong>综合</strong></td><td>C6–C11（多板、压力与稳定性）</td><td>2 块以上板级联无串扰；T10 跑 1000 次压力达标；寿命测试计数及连续 5 次失败自动停机正常；旋转屏幕不断连、杀进程重开配置保留。</td></tr>

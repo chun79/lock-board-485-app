@@ -34,7 +34,8 @@ object Modbus {
     const val REG_SINGLE_SECONDS = 0x000A
     const val LAST_REGISTER = 0x000A
 
-    const val EXPECTED_VERSION = 0x0002
+    const val MIN_VERSION = 0x0002
+    const val EXPECTED_VERSION = MIN_VERSION
     const val COIL_ON = 0xFF00
 
     fun describeFunction(fc: Int): String = when (fc and 0x7F) {

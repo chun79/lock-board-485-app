@@ -191,23 +191,42 @@ class TestRunner(
         val p = profiles(address)
         onProgress(Progress.Message("开始测试 ${p.displayName()}"))
 
-        // T0: both protocols must answer with the documented versions.
+        // T0: both protocols must report compatible versions (>= baseline 02 / 0002, reserved 00) and agree.
         val pv = client.execute(Command.GetVersion(address))
         val mv = client.executeModbus(ModbusRequest.ReadHoldingRegisters(address, Modbus.REG_VERSION, 1))
         val pvr = pv.confirmedReply()
         val mvr = (mv.confirmedReply() as? ModbusReply.Registers)?.value(Modbus.REG_VERSION)
         versions[0] = pvr?.bytes
         versions[1] = mvr
-        val t0Steps = listOf(
-            StepRecord("私有 0x01：${pv.describe()}", if (pvr != null && pvr.version == VersionReply.EXPECTED_VERSION && pvr.reserved == 0) Verdict.PASS else Verdict.FAIL, "文档值 02 00"),
-            StepRecord("MODBUS 03 读 0001：${mv.describe()}", if (mvr == Modbus.EXPECTED_VERSION) Verdict.PASS else Verdict.FAIL, "文档值 0002"),
-        )
+        val privOk = pvr != null && pvr.version >= VersionReply.MIN_VERSION && pvr.reserved == 0
+        val privDetail = when {
+            !privOk -> "要求 ≥ 02 00 且预留字节为 00"
+            pvr!!.version > VersionReply.MIN_VERSION -> "高于文档基准 02 00，按新固件兼容"
+            else -> "文档基准 ≥ 02 00"
+        }
+        val mbOk = mvr != null && mvr >= Modbus.MIN_VERSION
+        val mbDetail = when {
+            !mbOk -> "要求 ≥ 0002"
+            mvr!! > Modbus.MIN_VERSION -> "高于文档基准 0002，按新固件兼容"
+            else -> "文档基准 ≥ 0002"
+        }
+        val t0Steps = buildList {
+            add(StepRecord("私有 0x01：${pv.describe()}", if (privOk) Verdict.PASS else Verdict.FAIL, privDetail))
+            add(StepRecord("MODBUS 03 读 0001：${mv.describe()}", if (mbOk) Verdict.PASS else Verdict.FAIL, mbDetail))
+            if (pvr != null && mvr != null) {
+                add(
+                    if (pvr.version == mvr) StepRecord("双协议版本一致：私有 ${pvr.version.hex2()} == MODBUS ${"%04X".format(mvr)}", Verdict.PASS)
+                    else StepRecord("双协议版本不一致：私有 ${pvr.bytes.toHex()}，MODBUS ${"%04X".format(mvr)}", Verdict.FAIL, "同一双协议固件版本应一致"),
+                )
+            }
+        }
         val t0 = ItemResult("T0", "在线检查（双协议版本）", Verdict.aggregate(t0Steps.map { it.verdict }), "私有 ${pvr?.bytes?.toHex() ?: "无"}，MODBUS ${mvr?.let { "%04X".format(it) } ?: "无"}", t0Steps)
         out += t0
         onProgress(Progress.ItemFinished(address, t0))
         if (t0.verdict == Verdict.FAIL) return
 
-        if (plan.communication) item(out, address, "T1", "双协议通信（0x01 / 03 读 0001，各 ${plan.communicationCount} 次）") { communication() }
+        val boardVersion = pvr!!.version
+        if (plan.communication) item(out, address, "T1", "双协议通信（0x01 / 03 读 0001，各 ${plan.communicationCount} 次）") { communication(boardVersion) }
         if (plan.consistency) item(out, address, "T2", "反馈一致性（0x12 / 0x11×12 / 02 / 03）") { consistency() }
         if (plan.robustness) item(out, address, "T9", "私有异常帧容错（只读 0x01 诊断帧）") { robustness() }
         if (plan.modbusExceptions) item(out, address, "M7", "MODBUS 异常响应") { modbusExceptions(p) }
@@ -317,14 +336,14 @@ class TestRunner(
         }
     }
 
-    private suspend fun Ctx.communication(): String {
+    private suspend fun Ctx.communication(expectedVersion: Int): String {
         val priv = Tally()
         val mb = Tally()
         repeat(plan.communicationCount) {
             checkStop()
-            priv.add(client.execute(Command.GetVersion(address))) { it is VersionReply && it.version == VersionReply.EXPECTED_VERSION }
+            priv.add(client.execute(Command.GetVersion(address))) { it is VersionReply && it.version == expectedVersion && it.reserved == 0 }
             mb.add(client.executeModbus(ModbusRequest.ReadHoldingRegisters(address, Modbus.REG_VERSION, 1))) {
-                (it as? ModbusReply.Registers)?.value(Modbus.REG_VERSION) == Modbus.EXPECTED_VERSION
+                (it as? ModbusReply.Registers)?.value(Modbus.REG_VERSION) == expectedVersion
             }
         }
         priv.fill(metrics, "私有")

@@ -84,7 +84,7 @@ fun ControlScreen(controller: AppController) {
                 DipSwitchView(board.address)
             }
             Text(profile.displayName(), fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 6.dp))
-            Text("版本：${controller.versionText(board)}（文档值：私有 02 00，MODBUS 0002）")
+            Text("版本：${controller.versionText(board)}（文档基准：私有 ≥ 02 00，MODBUS ≥ 0002）")
             Hint("拨码(4321)：${DipSwitch.describe(board.address)}" + (board.updatedAtMillis?.let { "  · 更新于 ${SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(Date(it))}" } ?: ""))
             board.lastError?.let { Hint("最近错误：$it", FailColor) }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {

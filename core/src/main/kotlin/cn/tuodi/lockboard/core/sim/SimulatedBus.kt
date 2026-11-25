@@ -14,6 +14,7 @@ import cn.tuodi.lockboard.core.protocol.FrameParser
 import cn.tuodi.lockboard.core.protocol.LockMask
 import cn.tuodi.lockboard.core.protocol.ParseEvent
 import cn.tuodi.lockboard.core.protocol.Protocol
+import cn.tuodi.lockboard.core.protocol.VersionReply
 import cn.tuodi.lockboard.core.protocol.toByteArray
 import java.io.IOException
 import java.util.Random
@@ -30,6 +31,10 @@ data class SimBoardConfig(
     val stuckOpenChannels: Set<Int> = emptySet(),
     /** Wiring fault: pulsing key actually opens value. */
     val miswired: Map<Int, Int> = emptyMap(),
+    /** Firmware version reported by private 0x01 and MODBUS 0x0001 (defaults to baseline 02 / 0002). */
+    val privateVersion: Int = VersionReply.MIN_VERSION,
+    val privateReserved: Int = 0,
+    val modbusVersion: Int = Modbus.MIN_VERSION,
 )
 
 data class SimConfig(
@@ -313,7 +318,7 @@ class SimulatedBus(
             fun send(data: List<Int>, at: Long = now): Scheduled? =
                 reply(FrameCodec.encode(config.address, f.command, data, Direction.BOARD_TO_HOST), f.raw.size, at, crc = false)
             when (f.command) {
-                Cmd.GET_VERSION -> if (d.isEmpty()) send(listOf(0x02, 0x00))
+                Cmd.GET_VERSION -> if (d.isEmpty()) send(listOf(config.privateVersion and 0xFF, config.privateReserved and 0xFF))
                 Cmd.READ_ONE -> {
                     val ch = d.singleOrNull()?.takeIf { it in 1..12 } ?: return
                     send(listOf(ch, if (isOpen(ch, now)) 1 else 0))
@@ -404,7 +409,7 @@ class SimulatedBus(
                     if (qty !in 1..10 || start < 1 || start + qty - 1 > Modbus.LAST_REGISTER) return exc(2)
                     val regs = (start until start + qty).map { reg ->
                         when (reg) {
-                            Modbus.REG_VERSION -> Modbus.EXPECTED_VERSION
+                            Modbus.REG_VERSION -> config.modbusVersion and 0xFFFF
                             Modbus.REG_FEEDBACK_LO -> mask(now)
                             Modbus.REG_OUTPUT_LO -> continuous
                             else -> 0

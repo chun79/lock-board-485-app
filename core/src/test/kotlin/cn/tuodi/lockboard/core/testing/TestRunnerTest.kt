@@ -229,4 +229,37 @@ class TestRunnerTest {
         assertEquals(2, back.maxLockTimedSeconds)
         assertEquals(AppConfig(), ConfigJson.decode("{}"))
     }
+
+    @Test fun `newer dual-protocol firmware version 03 00 and 0003 passes T0 and read-only suite`() = runBlocking {
+        val (_, client, profiles) = setup(sim(SimBoardConfig(1, privateVersion = 3, modbusVersion = 3)))
+        val ro = unlockOnly.copy(
+            communication = true, consistency = true, robustness = true, modbusExceptions = true, stress = true,
+            unlockEach = false, modbusUnlockEach = false, unlockMany = false, modbusUnlockMany = false,
+            unlockSimultaneous = false, modbusSimultaneous = false, unlockAll = false,
+        )
+        val report = TestRunner(client, profiles, ro, NoOperator, "t").run(listOf(1))
+        for (id in listOf("T0", "T1", "T2", "T9", "T10")) assertEquals(id, Verdict.PASS, report.item(id)?.verdict)
+        assertEquals(listOf(3, 0), report.boards.single().privateVersion)
+        assertEquals(3, report.boards.single().modbusVersion)
+    }
+
+    @Test fun `mismatched private and modbus versions fail T0 and stop`() = runBlocking {
+        val (_, client, profiles) = setup(sim(SimBoardConfig(1, privateVersion = 3, modbusVersion = 2)))
+        val report = TestRunner(client, profiles, plan, NoOperator, "t").run(listOf(1))
+        assertEquals(1, report.boards.single().items.size)
+        assertEquals("T0", report.boards.single().items.single().id)
+        assertEquals(Verdict.FAIL, report.verdict)
+    }
+
+    @Test fun `below-minimum version or non-zero reserved byte fails T0`() = runBlocking {
+        val (_, lowClient, lowProfiles) = setup(sim(SimBoardConfig(1, privateVersion = 1, modbusVersion = 1)))
+        val lowReport = TestRunner(lowClient, lowProfiles, plan, NoOperator, "t").run(listOf(1))
+        assertEquals("T0", lowReport.boards.single().items.single().id)
+        assertEquals(Verdict.FAIL, lowReport.verdict)
+
+        val (_, resClient, resProfiles) = setup(sim(SimBoardConfig(1, privateVersion = 3, privateReserved = 1, modbusVersion = 3)))
+        val resReport = TestRunner(resClient, resProfiles, plan, NoOperator, "t").run(listOf(1))
+        assertEquals("T0", resReport.boards.single().items.single().id)
+        assertEquals(Verdict.FAIL, resReport.verdict)
+    }
 }
